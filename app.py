@@ -1,0 +1,1282 @@
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import json
+
+st.set_page_config(page_title="Travel Payment Dashboard", layout="wide")
+
+st.markdown("""
+<style>
+    .stApp { background-color: #f8f9fa; }
+    .stSidebar { background-color: #ffffff; border-right: 1px solid #ddd; }
+    h1, h2, h3 { color: #1f77b4; }
+</style>
+""", unsafe_allow_html=True)
+
+# ── Session state — init from URL params on first load ────────────────────────
+if "_initialized" not in st.session_state:
+    st.session_state._initialized = True
+    st.session_state.drill_country  = st.query_params.get("drill_country")  or None
+    st.session_state.drill_processor = st.query_params.get("drill_processor") or None
+    st.session_state.drill_method   = st.query_params.get("drill_method")   or None
+    st.session_state.drill_date     = st.query_params.get("drill_date")     or None
+else:
+    for _key in ["drill_country", "drill_processor", "drill_method", "drill_date"]:
+        if _key not in st.session_state:
+            st.session_state[_key] = None
+
+
+@st.cache_data
+def load_data():
+    with open("payments.json") as f:
+        data = json.load(f)
+    df = pd.DataFrame(data)
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df["date"] = df["timestamp"].dt.date
+    df["day"] = df["timestamp"].dt.day
+    df["hour"] = df["timestamp"].dt.hour
+    df["approved_int"] = df["approved"].astype(int)
+    df["amount_bin"] = pd.cut(
+        df["amount"],
+        bins=[0, 50, 200, 500, float("inf")],
+        labels=["$0–50", "$50–200", "$200–500", "$500+"]
+    )
+    return df
+
+
+def top_val(series):
+    vc = series.value_counts()
+    return vc.idxmax() if len(vc) > 0 else "N/A"
+
+
+def generate_insights(df):
+    insights = []
+    if df.empty or len(df) < 20:
+        return insights
+    overall_rate = df["approved_int"].mean() * 100
+
+    # 1. Processor outage: any processor × day with <30% approval (min 15 txns)
+    proc_daily = df.groupby(["processor", "date"]).agg(
+        total=("id", "count"), approved_sum=("approved_int", "sum")
+    ).reset_index()
+    proc_daily["rate"] = proc_daily["approved_sum"] / proc_daily["total"] * 100
+    for _, row in proc_daily.iterrows():
+        if row["total"] < 15 or row["rate"] >= 30:
+            continue
+        sub_dec = df[(df["processor"] == row["processor"]) &
+                     (df["date"] == row["date"]) & ~df["approved"]]
+        if sub_dec.empty:
+            continue
+        top_reason = top_val(sub_dec["decline_reason"])
+        top_pct = sub_dec["decline_reason"].value_counts().iloc[0] / len(sub_dec) * 100
+        insights.append({
+            "level": "error",
+            "title": f"{row['processor']} outage on {row['date']}",
+            "text": (
+                f"**{row['processor']}** had only **{row['rate']:.1f}%** approval on **{row['date']}** "
+                f"({int(row['total'])} transactions). "
+                f"**{top_reason}** made up {top_pct:.0f}% of declines — likely a technical incident."
+            )
+        })
+
+    # 2. Daily approval rate drops (>15pp below overall, min 20 txns)
+    daily_agg = df.groupby("date").agg(
+        total=("id", "count"), approved_sum=("approved_int", "sum")
+    ).reset_index()
+    daily_agg["rate"] = daily_agg["approved_sum"] / daily_agg["total"] * 100
+    for _, row in daily_agg.iterrows():
+        drop = overall_rate - row["rate"]
+        if row["total"] < 20 or drop <= 15:
+            continue
+        day_df = df[df["date"] == row["date"]]
+        proc_rates = day_df.groupby("processor").agg(
+            total=("id", "count"), approved=("approved_int", "sum"))
+        proc_rates["rate"] = proc_rates["approved"] / proc_rates["total"] * 100
+        worst_proc = proc_rates["rate"].idxmin()
+        worst_rate = proc_rates.loc[worst_proc, "rate"]
+        day_dec = day_df[~day_df["approved"]]
+        top_reason = top_val(day_dec["decline_reason"])
+        top_pct = day_dec["decline_reason"].value_counts().iloc[0] / len(day_dec) * 100 if not day_dec.empty else 0
+        already = any(str(row["date"]) in i["title"] and "outage" in i["title"] for i in insights)
+        if not already:
+            insights.append({
+                "level": "error",
+                "title": f"Approval rate drop on {row['date']}",
+                "text": (
+                    f"Approval fell to **{row['rate']:.1f}%** on **{row['date']}** "
+                    f"({drop:.0f}pp below average of {overall_rate:.1f}%). "
+                    f"{worst_proc} was worst at {worst_rate:.1f}%. "
+                    f"Top decline: **{top_reason}** ({top_pct:.0f}% of that day's declines)."
+                )
+            })
+
+    # 3. Country × Method underperformance (>15pp below overall, min 10 txns)
+    cm = df.groupby(["country", "payment_method"]).agg(
+        total=("id", "count"), approved_sum=("approved_int", "sum")
+    ).reset_index()
+    cm["rate"] = cm["approved_sum"] / cm["total"] * 100
+    for _, row in cm.iterrows():
+        if row["total"] < 10 or (overall_rate - row["rate"]) <= 15:
+            continue
+        sub_dec = df[(df["country"] == row["country"]) &
+                     (df["payment_method"] == row["payment_method"]) & ~df["approved"]]
+        if sub_dec.empty:
+            continue
+        top_reason = top_val(sub_dec["decline_reason"])
+        top_pct = sub_dec["decline_reason"].value_counts().iloc[0] / len(sub_dec) * 100
+        insights.append({
+            "level": "warning",
+            "title": f"{row['payment_method']} in {row['country']} underperforming",
+            "text": (
+                f"**{row['payment_method']}** in **{row['country']}** has only **{row['rate']:.1f}%** approval "
+                f"({overall_rate - row['rate']:.0f}pp below average). "
+                f"Top decline: **{top_reason}** ({top_pct:.0f}% of declines, {int(row['total'])} txns)."
+            )
+        })
+
+    # 4. High-value transaction gap (>$400, >10pp gap)
+    high_val = df[df["amount"] > 400]
+    if len(high_val) >= 10:
+        high_rate = high_val["approved_int"].mean() * 100
+        gap = overall_rate - high_rate
+        if gap > 10:
+            hv_dec = high_val[~high_val["approved"]]
+            top_reason = top_val(hv_dec["decline_reason"])
+            top_pct = hv_dec["decline_reason"].value_counts().iloc[0] / len(hv_dec) * 100 if not hv_dec.empty else 0
+            insights.append({
+                "level": "warning",
+                "title": "High-value transactions (>$400) underperforming",
+                "text": (
+                    f"Transactions above $400 have **{high_rate:.1f}%** approval — "
+                    f"**{gap:.0f}pp lower** than overall ({overall_rate:.1f}%). "
+                    f"Primary driver: **{top_reason}** ({top_pct:.0f}% of high-value declines, {len(high_val)} txns)."
+                )
+            })
+
+    # 5. 3DS spike detection (>35% of card declines in any region)
+    card_methods = ["card_visa", "card_mastercard"]
+    for label, countries_list in {
+        "Europe (Spain + Germany)": ["Spain", "Germany"],
+        "Brazil": ["Brazil"], "Mexico": ["Mexico"],
+        "Argentina": ["Argentina"], "Colombia": ["Colombia"],
+    }.items():
+        sub = df[df["country"].isin(countries_list) &
+                 df["payment_method"].isin(card_methods) & ~df["approved"]]
+        if len(sub) < 10:
+            continue
+        tds_rate = (sub["decline_reason"] == "3ds_failure").mean() * 100
+        if tds_rate <= 35:
+            continue
+        timing = ""
+        h1 = sub[sub["day"] <= 15]
+        h2 = sub[sub["day"] > 15]
+        if len(h1) >= 5 and len(h2) >= 5:
+            r1 = (h1["decline_reason"] == "3ds_failure").mean() * 100
+            r2 = (h2["decline_reason"] == "3ds_failure").mean() * 100
+            if r2 - r1 > 15:
+                timing = " Spike started in the **second half of the month** (Nov 16+)."
+        insights.append({
+            "level": "warning",
+            "title": f"3DS failure spike in {label}",
+            "text": (
+                f"**{tds_rate:.0f}%** of card declines in **{label}** are **3DS failures** "
+                f"({len(sub)} declined card txns).{timing} Investigate 3DS config for this region."
+            )
+        })
+
+    # 6. Processor × Country underperformance (>20pp below overall, min 10 txns)
+    pc = df.groupby(["processor", "country"]).agg(
+        total=("id", "count"), approved_sum=("approved_int", "sum")
+    ).reset_index()
+    pc["rate"] = pc["approved_sum"] / pc["total"] * 100
+    for _, row in pc.iterrows():
+        if row["total"] < 10 or (overall_rate - row["rate"]) <= 20:
+            continue
+        sub_dec = df[(df["processor"] == row["processor"]) &
+                     (df["country"] == row["country"]) & ~df["approved"]]
+        if sub_dec.empty:
+            continue
+        top_reason = top_val(sub_dec["decline_reason"])
+        top_pct = sub_dec["decline_reason"].value_counts().iloc[0] / len(sub_dec) * 100
+        insights.append({
+            "level": "warning",
+            "title": f"{row['processor']} underperforming in {row['country']}",
+            "text": (
+                f"**{row['processor']}** in **{row['country']}**: **{row['rate']:.1f}%** approval "
+                f"({overall_rate - row['rate']:.0f}pp below average). "
+                f"Top decline: **{top_reason}** ({top_pct:.0f}%, {int(row['total'])} txns)."
+            )
+        })
+
+    seen, unique = set(), []
+    for ins in insights:
+        if ins["title"] not in seen:
+            seen.add(ins["title"])
+            unique.append(ins)
+    unique.sort(key=lambda x: 0 if x["level"] == "error" else 1)
+    return unique
+
+
+def generate_recommendations(df):
+    """Produce specific, actionable recommendations based on data patterns."""
+    recs = []
+    if df.empty or len(df) < 20:
+        return recs
+
+    overall_rate = df["approved_int"].mean() * 100
+
+    # 1. Processor outage → escalate + failover
+    proc_daily = df.groupby(["processor", "date"]).agg(
+        total=("id", "count"), approved_sum=("approved_int", "sum")
+    ).reset_index()
+    proc_daily["rate"] = proc_daily["approved_sum"] / proc_daily["total"] * 100
+    for _, row in proc_daily.iterrows():
+        if row["total"] < 15 or row["rate"] >= 30:
+            continue
+        other_procs = [p for p in df["processor"].unique() if p != row["processor"]]
+        recs.append({
+            "priority": "high",
+            "action": f"Escalate {row['processor']} outage on {row['date']}",
+            "detail": (
+                f"{row['processor']} dropped to {row['rate']:.0f}% approval on {row['date']}. "
+                f"Open a P1 ticket with {row['processor']} immediately. "
+                f"Enable automatic failover to {' or '.join(other_procs)} for affected segments until resolved."
+            )
+        })
+
+    # 2. Processor × Country underperformance → re-route
+    pc = df.groupby(["processor", "country"]).agg(
+        total=("id", "count"), approved_sum=("approved_int", "sum")
+    ).reset_index()
+    pc["rate"] = pc["approved_sum"] / pc["total"] * 100
+    for _, row in pc.iterrows():
+        if row["total"] < 15:
+            continue
+        drop = overall_rate - row["rate"]
+        if drop <= 20:
+            continue
+        other_procs = [p for p in df["processor"].unique() if p != row["processor"]]
+        recs.append({
+            "priority": "medium",
+            "action": f"Re-route {row['country']} payments away from {row['processor']}",
+            "detail": (
+                f"{row['processor']} has only {row['rate']:.0f}% approval in {row['country']} "
+                f"({drop:.0f}pp below average across {int(row['total'])} transactions). "
+                f"Consider routing this market to {' or '.join(other_procs)} as primary processor."
+            )
+        })
+
+    # 3. 3DS spike → investigate configuration
+    card_methods = ["card_visa", "card_mastercard"]
+    for label, countries_list in {
+        "Europe (Spain + Germany)": ["Spain", "Germany"],
+        "Brazil": ["Brazil"], "Mexico": ["Mexico"],
+        "Argentina": ["Argentina"], "Colombia": ["Colombia"],
+    }.items():
+        sub = df[df["country"].isin(countries_list) &
+                 df["payment_method"].isin(card_methods) & ~df["approved"]]
+        if len(sub) < 10:
+            continue
+        tds_rate = (sub["decline_reason"] == "3ds_failure").mean() * 100
+        if tds_rate <= 35:
+            continue
+        recs.append({
+            "priority": "medium",
+            "action": f"Investigate 3DS configuration for {label} card payments",
+            "detail": (
+                f"{tds_rate:.0f}% of card declines in {label} are 3DS failures. "
+                f"Check with your 3DS provider for recent issuer rule changes. "
+                f"Consider enabling 3DS exemptions (e.g., low-value or trusted merchant) for low-risk transactions in this region."
+            )
+        })
+
+    # 4. High-value transactions underperforming → fraud rules or routing
+    high_val = df[df["amount"] > 400]
+    if len(high_val) >= 10:
+        high_rate = high_val["approved_int"].mean() * 100
+        gap = overall_rate - high_rate
+        if gap > 10:
+            hv_dec = high_val[~high_val["approved"]]
+            top_reason = top_val(hv_dec["decline_reason"]) if not hv_dec.empty else "unknown"
+            if "fraud" in top_reason.lower():
+                recs.append({
+                    "priority": "medium",
+                    "action": "Review fraud rules for high-value transactions (>$400)",
+                    "detail": (
+                        f"Transactions above $400 have {high_rate:.0f}% approval — {gap:.0f}pp below average, "
+                        f"driven by {top_reason}. Audit fraud scoring thresholds for this segment: "
+                        f"tighten rules for genuinely risky patterns while reducing false positives on legitimate high-value bookings."
+                    )
+                })
+            else:
+                recs.append({
+                    "priority": "low",
+                    "action": "Offer instalment or split-payment options for high-value bookings (>$400)",
+                    "detail": (
+                        f"High-value transactions have {gap:.0f}pp lower approval (top decline: {top_reason}). "
+                        f"Offering instalment plans or split-payment at checkout can reduce declines caused by card limits or insufficient funds."
+                    )
+                })
+
+    # 5. Country × Method underperformance → alternative methods or failover
+    cm = df.groupby(["country", "payment_method"]).agg(
+        total=("id", "count"), approved_sum=("approved_int", "sum")
+    ).reset_index()
+    cm["rate"] = cm["approved_sum"] / cm["total"] * 100
+    alt_methods = {"Brazil": "PIX", "Mexico": "OXXO", "Colombia": "card_visa",
+                   "Argentina": "card_mastercard", "Spain": "SEPA", "Germany": "SEPA"}
+    for _, row in cm.iterrows():
+        if row["total"] < 10:
+            continue
+        drop = overall_rate - row["rate"]
+        if drop <= 15:
+            continue
+        sub_dec = df[(df["country"] == row["country"]) &
+                     (df["payment_method"] == row["payment_method"]) & ~df["approved"]]
+        if sub_dec.empty:
+            continue
+        top_reason = top_val(sub_dec["decline_reason"])
+        alt = alt_methods.get(row["country"], "an alternative local method")
+        if top_reason == "technical_error":
+            recs.append({
+                "priority": "medium",
+                "action": f"Enable processor failover for {row['payment_method']} in {row['country']}",
+                "detail": (
+                    f"{row['payment_method']} in {row['country']} has {row['rate']:.0f}% approval with "
+                    f"technical_error as top decline — likely a processor-side issue. "
+                    f"Enable automatic retry on a secondary processor for this segment."
+                )
+            })
+        elif top_reason in ("insufficient_funds", "expired_card"):
+            if alt != row["payment_method"]:
+                recs.append({
+                    "priority": "low",
+                    "action": f"Surface {alt} as fallback for {row['payment_method']} failures in {row['country']}",
+                    "detail": (
+                        f"{row['payment_method']} in {row['country']} declines are mainly {top_reason} "
+                        f"({int(row['total'])} transactions, {row['rate']:.0f}% approval). "
+                        f"Prompt users who fail with {row['payment_method']} to retry with {alt} at checkout."
+                    )
+                })
+
+    # Deduplicate and sort by priority
+    seen, unique = set(), []
+    for rec in recs:
+        if rec["action"] not in seen:
+            seen.add(rec["action"])
+            unique.append(rec)
+    unique.sort(key=lambda x: {"high": 0, "medium": 1, "low": 2}.get(x["priority"], 3))
+    return unique
+
+
+# ── Load data ─────────────────────────────────────────────────────────────────
+df = load_data()
+
+# ── URL param helpers (shareable URLs) ────────────────────────────────────────
+def _qp_list(key, all_opts):
+    raw = st.query_params.get(key, "")
+    if not raw:
+        return list(all_opts)
+    vals = [v.strip() for v in raw.split(",")]
+    valid = [v for v in vals if v in all_opts]
+    return valid if valid else list(all_opts)
+
+def _qp_range(key):
+    raw = st.query_params.get(key, "")
+    if raw:
+        try:
+            a, b = raw.split("-", 1)
+            return (max(1, int(a)), min(30, int(b)))
+        except (ValueError, AttributeError):
+            pass
+    return (1, 30)
+
+# ── Sidebar filters ───────────────────────────────────────────────────────────
+st.sidebar.image("Yuno logo.png", use_container_width=True)
+st.sidebar.header("Filters")
+_all_countries  = sorted(df["country"].unique())
+_all_processors = sorted(df["processor"].unique())
+_all_methods    = sorted(df["payment_method"].unique())
+_all_amounts    = ["$0–50", "$50–200", "$200–500", "$500+"]
+_all_reasons    = sorted(df["decline_reason"].dropna().unique())
+
+day_range      = st.sidebar.slider("Day of November", 1, 30, _qp_range("days"))
+countries      = st.sidebar.multiselect("Country",                  _all_countries,  default=_qp_list("countries",  _all_countries))
+processors     = st.sidebar.multiselect("Processor",                _all_processors, default=_qp_list("processors", _all_processors))
+methods        = st.sidebar.multiselect("Payment Method",           _all_methods,    default=_qp_list("methods",    _all_methods))
+amount_bins    = st.sidebar.multiselect("Amount Bracket",           _all_amounts,    default=_qp_list("amounts",    _all_amounts))
+all_reasons    = _all_reasons
+decline_reasons = st.sidebar.multiselect("Decline Reason (declined only)", all_reasons, default=_qp_list("reasons", all_reasons))
+
+# Active click-drill display + clear button
+active_drills = {k: v for k, v in {
+    "Country": st.session_state.drill_country,
+    "Processor": st.session_state.drill_processor,
+    "Method": st.session_state.drill_method,
+    "Date": str(st.session_state.drill_date) if st.session_state.drill_date else None,
+}.items() if v}
+if active_drills:
+    st.sidebar.divider()
+    st.sidebar.markdown("**Click-drill active:**")
+    for dim, val in active_drills.items():
+        st.sidebar.markdown(f"- {dim}: `{val}`")
+    if st.sidebar.button("Clear click filters"):
+        st.session_state.drill_country = None
+        st.session_state.drill_processor = None
+        st.session_state.drill_method = None
+        st.session_state.drill_date = None
+        st.rerun()
+
+# ── Sync current state back to URL (makes every view shareable) ───────────────
+_url_params = {
+    "days":       f"{day_range[0]}-{day_range[1]}",
+    "countries":  ",".join(countries),
+    "processors": ",".join(processors),
+    "methods":    ",".join(methods),
+    "amounts":    ",".join(amount_bins),
+    "reasons":    ",".join(decline_reasons),
+}
+if st.session_state.drill_country:
+    _url_params["drill_country"] = st.session_state.drill_country
+if st.session_state.drill_processor:
+    _url_params["drill_processor"] = st.session_state.drill_processor
+if st.session_state.drill_method:
+    _url_params["drill_method"] = st.session_state.drill_method
+st.query_params.update(_url_params)
+for _dk in ["drill_country", "drill_processor", "drill_method"]:
+    if not st.session_state.get(_dk) and _dk in st.query_params:
+        del st.query_params[_dk]
+
+# Share hint in sidebar
+st.sidebar.divider()
+st.sidebar.markdown("**Share this view**")
+st.sidebar.caption("The browser URL updates with every filter change. Copy it to share this exact view.")
+
+# Cohort comparison period selectors
+st.sidebar.divider()
+st.sidebar.markdown("**Cohort Comparison**")
+period_a = st.sidebar.slider("Period A", 1, 30, (1, 15),  key="period_a")
+period_b = st.sidebar.slider("Period B", 1, 30, (16, 30), key="period_b")
+
+# ── Apply sidebar filters ─────────────────────────────────────────────────────
+overview_df = df[
+    df["day"].between(day_range[0], day_range[1]) &
+    df["country"].isin(countries) &
+    df["processor"].isin(processors) &
+    df["payment_method"].isin(methods) &
+    df["amount_bin"].isin(amount_bins)
+].copy()
+overview_df = overview_df[overview_df["approved"] | overview_df["decline_reason"].isin(decline_reasons)]
+
+# Apply click drill-downs for detail views
+fdf = overview_df.copy()
+if st.session_state.drill_country:
+    fdf = fdf[fdf["country"] == st.session_state.drill_country]
+if st.session_state.drill_processor:
+    fdf = fdf[fdf["processor"] == st.session_state.drill_processor]
+if st.session_state.drill_method:
+    fdf = fdf[fdf["payment_method"] == st.session_state.drill_method]
+
+# ── Title & KPIs ──────────────────────────────────────────────────────────────
+st.title("✈ Luna Travel — Payment Acceptance Dashboard")
+st.caption(f"November 2023 · Nov {day_range[0]}–{day_range[1]} · Mock transaction data")
+
+if active_drills:
+    drill_str = " · ".join(f"{k}: **{v}**" for k, v in active_drills.items())
+    st.info(f"Drill-down active — {drill_str}. Click **Clear click filters** in the sidebar to reset.")
+
+total = len(fdf)
+approved_n = int(fdf["approved"].sum())
+declined_n = total - approved_n
+approval_rate = approved_n / total * 100 if total else 0
+total_volume = fdf["amount"].sum()
+
+k1, k2, k3, k4, k5 = st.columns(5)
+k1.metric("Total Transactions", f"{total:,}")
+k2.metric("Approved", f"{approved_n:,}")
+k3.metric("Declined", f"{declined_n:,}")
+k4.metric("Approval Rate", f"{approval_rate:.1f}%")
+k5.metric("Total Volume", f"${total_volume:,.0f}")
+
+st.divider()
+
+# ── What Changed? ─────────────────────────────────────────────────────────────
+insights = generate_insights(fdf)
+if insights:
+    st.subheader("What Changed? — Auto-detected Insights")
+    st.caption(f"{len(insights)} anomaly/insight{'s' if len(insights) != 1 else ''} detected in current view")
+    for ins in insights:
+        if ins["level"] == "error":
+            st.error(f"🔴 **{ins['title']}** — {ins['text']}")
+        else:
+            st.warning(f"🟡 **{ins['title']}** — {ins['text']}")
+else:
+    st.success("No anomalies detected in the current view.")
+st.divider()
+
+# ── Smart Recommendations ─────────────────────────────────────────────────────
+recs = generate_recommendations(fdf)
+if recs:
+    st.subheader("Smart Recommendations")
+    st.caption(f"{len(recs)} action{'s' if len(recs) != 1 else ''} suggested based on current data patterns")
+    for rec in recs:
+        if rec["priority"] == "high":
+            st.error(f"🔴 **[HIGH] {rec['action']}** — {rec['detail']}")
+        elif rec["priority"] == "medium":
+            st.warning(f"🟡 **[MEDIUM] {rec['action']}** — {rec['detail']}")
+        else:
+            st.info(f"🔵 **[LOW] {rec['action']}** — {rec['detail']}")
+    st.divider()
+
+# ── What-If Simulator ─────────────────────────────────────────────────────────
+st.subheader("What-If Simulator")
+st.caption("Estimate the impact of routing decisions. Simulated approvals are based on the target processor's observed rates for the same country × method × amount bracket combinations.")
+
+w1, w2, w3 = st.columns(3)
+with w1:
+    sim_source = st.selectbox("Route away from", _all_processors, key="sim_source")
+with w2:
+    sim_target_opts = [p for p in _all_processors if p != sim_source]
+    sim_target = st.selectbox("Route to", sim_target_opts, key="sim_target")
+with w3:
+    sim_days = st.slider("During Nov days", 1, 30, (18, 18), key="sim_days")
+
+w4, w5 = st.columns(2)
+with w4:
+    sim_countries = st.multiselect("Limit to countries (blank = all)", _all_countries, key="sim_countries")
+with w5:
+    sim_methods = st.multiselect("Limit to methods (blank = all)", _all_methods, key="sim_methods")
+
+# ── Build simulation ──────────────────────────────────────────────────────────
+affected = overview_df[
+    (overview_df["processor"] == sim_source) &
+    (overview_df["day"].between(sim_days[0], sim_days[1]))
+].copy()
+if sim_countries:
+    affected = affected[affected["country"].isin(sim_countries)]
+if sim_methods:
+    affected = affected[affected["payment_method"].isin(sim_methods)]
+
+target_df = overview_df[overview_df["processor"] == sim_target]
+target_overall = target_df["approved_int"].mean() if len(target_df) > 0 else 0.75
+
+# Target rates by country × method × amount_bin
+target_rates = (
+    target_df.groupby(["country", "payment_method", "amount_bin"], observed=True)
+    .agg(approved_sum=("approved_int", "sum"), total=("id", "count"))
+    .reset_index()
+)
+target_rates["rate"] = target_rates["approved_sum"] / target_rates["total"]
+
+# Target rates by country × method (fallback)
+target_rates_cm = (
+    target_df.groupby(["country", "payment_method"])
+    .agg(approved_sum=("approved_int", "sum"), total=("id", "count"))
+    .reset_index()
+)
+target_rates_cm["rate_cm"] = target_rates_cm["approved_sum"] / target_rates_cm["total"]
+
+if len(affected) > 0:
+    # Merge granular rates
+    sim_df = affected.merge(
+        target_rates[["country", "payment_method", "amount_bin", "rate"]],
+        on=["country", "payment_method", "amount_bin"], how="left"
+    ).merge(
+        target_rates_cm[["country", "payment_method", "rate_cm"]],
+        on=["country", "payment_method"], how="left"
+    )
+    sim_df["sim_rate"] = sim_df["rate"].fillna(sim_df["rate_cm"]).fillna(target_overall)
+
+    n_aff        = len(sim_df)
+    actual_appr  = int(sim_df["approved"].sum())
+    actual_rate  = actual_appr / n_aff * 100
+    sim_appr     = sim_df["sim_rate"].sum()           # expected approvals
+    sim_rate     = sim_appr / n_aff * 100
+    delta_appr   = sim_appr - actual_appr
+    avg_amount   = sim_df["amount"].mean()
+    recov_rev    = delta_appr * avg_amount
+
+    # KPI cards
+    r1, r2, r3, r4, r5 = st.columns(5)
+    r1.metric("Transactions affected", f"{n_aff:,}")
+    r2.metric("Actual approvals",      f"{actual_appr:,}", f"{actual_rate:.1f}%")
+    r3.metric("Simulated approvals",   f"{sim_appr:.0f}",  f"{sim_rate:.1f}%")
+    r4.metric("Approval rate delta",   f"{sim_rate - actual_rate:+.1f}pp")
+    r5.metric("Est. recovered revenue",f"${recov_rev:,.0f}", f"+{delta_appr:.0f} txns")
+
+    # Breakdown charts
+    def _sim_agg(col):
+        g = sim_df.groupby(col).agg(
+            actual_approved=("approved_int", "sum"),
+            sim_approved=("sim_rate", "sum"),
+            total=("id", "count")
+        ).reset_index()
+        g["actual_rate"] = g["actual_approved"] / g["total"] * 100
+        g["sim_rate_pct"] = g["sim_approved"]   / g["total"] * 100
+        return g
+
+    agg_country = _sim_agg("country")
+    agg_method  = _sim_agg("payment_method")
+
+    # Reshape for grouped bar
+    def _melt_for_plot(g, col):
+        a = g[[col, "actual_rate"]].rename(columns={"actual_rate": "approval_rate"})
+        a["scenario"] = f"Actual ({sim_source})"
+        b = g[[col, "sim_rate_pct"]].rename(columns={"sim_rate_pct": "approval_rate"})
+        b["scenario"] = f"Simulated ({sim_target})"
+        return pd.concat([a, b])
+
+    sc1, sc2 = st.columns(2)
+    with sc1:
+        comp = _melt_for_plot(agg_country, "country")
+        fig = px.bar(comp, x="country", y="approval_rate", color="scenario",
+                     barmode="group", title="Actual vs Simulated — by Country",
+                     color_discrete_map={
+                         f"Actual ({sim_source})": "#E74C3C",
+                         f"Simulated ({sim_target})": "#2ECC71"
+                     })
+        fig.update_layout(yaxis_range=[0, 100], xaxis_title="", yaxis_title="Approval Rate (%)")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with sc2:
+        comp = _melt_for_plot(agg_method, "payment_method")
+        fig = px.bar(comp, x="payment_method", y="approval_rate", color="scenario",
+                     barmode="group", title="Actual vs Simulated — by Method",
+                     color_discrete_map={
+                         f"Actual ({sim_source})": "#E74C3C",
+                         f"Simulated ({sim_target})": "#2ECC71"
+                     })
+        fig.update_layout(yaxis_range=[0, 100], xaxis_title="", yaxis_title="Approval Rate (%)")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Daily impact chart (if date range > 1 day)
+    if sim_days[1] > sim_days[0]:
+        agg_day = sim_df.groupby("day").agg(
+            actual_approved=("approved_int", "sum"),
+            sim_approved=("sim_rate", "sum"),
+            total=("id", "count")
+        ).reset_index()
+        agg_day["actual_rate"]  = agg_day["actual_approved"] / agg_day["total"] * 100
+        agg_day["sim_rate_pct"] = agg_day["sim_approved"]    / agg_day["total"] * 100
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=agg_day["day"], y=agg_day["actual_rate"],
+                                 name=f"Actual ({sim_source})", mode="lines+markers",
+                                 line=dict(color="#E74C3C")))
+        fig.add_trace(go.Scatter(x=agg_day["day"], y=agg_day["sim_rate_pct"],
+                                 name=f"Simulated ({sim_target})", mode="lines+markers",
+                                 line=dict(color="#2ECC71", dash="dash")))
+        fig.update_layout(title="Daily Approval Rate: Actual vs Simulated",
+                          xaxis_title="Day of November", yaxis_title="Approval Rate (%)",
+                          yaxis_range=[0, 100])
+        st.plotly_chart(fig, use_container_width=True)
+else:
+    st.info(f"No transactions found for {sim_source} during Nov {sim_days[0]}–{sim_days[1]} with the selected filters.")
+
+st.divider()
+
+# ── Cohort Comparison ─────────────────────────────────────────────────────────
+st.subheader("Cohort Comparison")
+label_a = f"Period A  (Nov {period_a[0]}–{period_a[1]})"
+label_b = f"Period B  (Nov {period_b[0]}–{period_b[1]})"
+st.caption(f"{label_a}  ·  {label_b} — using current sidebar filters")
+
+df_a = overview_df[overview_df["day"].between(period_a[0], period_a[1])].copy()
+df_b = overview_df[overview_df["day"].between(period_b[0], period_b[1])].copy()
+
+def _kpis(d):
+    t = len(d)
+    a = int(d["approved"].sum())
+    return {"total": t, "approved": a, "declined": t - a,
+            "rate": a / t * 100 if t else 0, "volume": d["amount"].sum()}
+
+ka, kb = _kpis(df_a), _kpis(df_b)
+
+# KPI delta row
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Approval Rate A",  f"{ka['rate']:.1f}%",   delta=f"{ka['rate']  - kb['rate']:+.1f}pp vs B")
+c2.metric("Approval Rate B",  f"{kb['rate']:.1f}%")
+c3.metric("Transactions A",   f"{ka['total']:,}",      delta=f"{ka['total'] - kb['total']:+,} vs B")
+c4.metric("Declined A",       f"{ka['declined']:,}",   delta=f"{ka['declined'] - kb['declined']:+,} vs B", delta_color="inverse")
+c5.metric("Volume A",         f"${ka['volume']:,.0f}", delta=f"${ka['volume'] - kb['volume']:+,.0f} vs B")
+
+# Helper: aggregate by dimension for both periods
+def _cohort_agg(da, db, col):
+    def _agg(d, lbl):
+        g = d.groupby(col).agg(total=("id","count"), approved_sum=("approved_int","sum")).reset_index()
+        g["approval_rate"] = g["approved_sum"] / g["total"] * 100
+        g["period"] = lbl
+        return g
+    return pd.concat([_agg(da, label_a), _agg(db, label_b)])
+
+period_colors = {label_a: "#4C9BE8", label_b: "#E67E22"}
+
+comp_country  = _cohort_agg(df_a, df_b, "country")
+comp_method   = _cohort_agg(df_a, df_b, "payment_method")
+comp_proc     = _cohort_agg(df_a, df_b, "processor")
+
+def _dec_counts(d, lbl):
+    g = d[~d["approved"]]["decline_reason"].value_counts().reset_index()
+    g.columns = ["reason", "count"]
+    g["period"] = lbl
+    return g
+comp_dec = pd.concat([_dec_counts(df_a, label_a), _dec_counts(df_b, label_b)])
+
+# Charts
+ch1, ch2 = st.columns(2)
+with ch1:
+    fig = px.bar(comp_country, x="country", y="approval_rate", color="period",
+                 barmode="group", title="Approval Rate by Country: A vs B",
+                 color_discrete_map=period_colors)
+    fig.update_layout(yaxis_range=[0, 100], xaxis_title="", yaxis_title="Approval Rate (%)")
+    st.plotly_chart(fig, use_container_width=True)
+
+with ch2:
+    fig = px.bar(comp_method, x="payment_method", y="approval_rate", color="period",
+                 barmode="group", title="Approval Rate by Method: A vs B",
+                 color_discrete_map=period_colors)
+    fig.update_layout(yaxis_range=[0, 100], xaxis_title="", yaxis_title="Approval Rate (%)")
+    st.plotly_chart(fig, use_container_width=True)
+
+ch3, ch4 = st.columns(2)
+with ch3:
+    fig = px.bar(comp_proc, x="processor", y="approval_rate", color="period",
+                 barmode="group", title="Approval Rate by Processor: A vs B",
+                 color_discrete_map=period_colors)
+    fig.update_layout(yaxis_range=[0, 100], xaxis_title="", yaxis_title="Approval Rate (%)")
+    st.plotly_chart(fig, use_container_width=True)
+
+with ch4:
+    fig = px.bar(comp_dec, x="reason", y="count", color="period",
+                 barmode="group", title="Decline Reasons: A vs B",
+                 color_discrete_map=period_colors)
+    fig.update_layout(xaxis_title="", yaxis_title="Count")
+    st.plotly_chart(fig, use_container_width=True)
+
+st.divider()
+
+# ── Section 1: Time Trends ────────────────────────────────────────────────────
+st.subheader("Time Trends")
+
+daily = fdf.groupby("date").agg(
+    transactions=("id", "count"),
+    approved_sum=("approved_int", "sum")
+).reset_index()
+daily["approved_pct"] = daily["approved_sum"] / daily["transactions"] * 100
+daily["declined"] = daily["transactions"] - daily["approved_sum"]
+top_dec_day = (
+    fdf[~fdf["approved"]].groupby("date")["decline_reason"]
+    .agg(lambda x: top_val(x)).reset_index().rename(columns={"decline_reason": "top_decline"})
+)
+daily = daily.merge(top_dec_day, on="date", how="left")
+daily["top_decline"] = daily["top_decline"].fillna("N/A")
+
+hourly = fdf.groupby("hour").agg(
+    transactions=("id", "count"),
+    approved_sum=("approved_int", "sum")
+).reset_index()
+hourly["approved_pct"] = hourly["approved_sum"] / hourly["transactions"] * 100
+
+t1, t2 = st.columns(2)
+
+with t1:
+    vol_type = st.radio("Volume chart", ["Bar", "Line"], horizontal=True, key="vol_type")
+    if vol_type == "Bar":
+        fig_vol = go.Figure(go.Bar(
+            x=daily["date"], y=daily["transactions"],
+            marker_color="#4C9BE8",
+            customdata=daily[["approved_sum", "declined", "top_decline"]].values,
+            hovertemplate=(
+                "<b>%{x}</b><br>"
+                "Transactions: %{y:,}<br>"
+                "Approved: %{customdata[0]:,}<br>"
+                "Declined: %{customdata[1]:,}<br>"
+                "Top decline reason: %{customdata[2]}"
+                "<extra></extra>"
+            )
+        ))
+    else:
+        fig_vol = go.Figure(go.Scatter(
+            x=daily["date"], y=daily["transactions"],
+            mode="lines+markers", line=dict(color="#4C9BE8"),
+            customdata=daily[["approved_sum", "declined", "top_decline"]].values,
+            hovertemplate=(
+                "<b>%{x}</b><br>"
+                "Transactions: %{y:,}<br>"
+                "Approved: %{customdata[0]:,}<br>"
+                "Declined: %{customdata[1]:,}<br>"
+                "Top decline reason: %{customdata[2]}"
+                "<extra></extra>"
+            )
+        ))
+    fig_vol.update_layout(title="Daily Transaction Volume — click a bar to drill down", xaxis_title="", yaxis_title="Transactions")
+    ev_vol = st.plotly_chart(fig_vol, on_select="rerun", use_container_width=True)
+    try:
+        if ev_vol.selection.points:
+            clicked_x = ev_vol.selection.points[0].get("x")
+            if clicked_x:
+                parsed = pd.to_datetime(clicked_x).date()
+                new_val = None if parsed == st.session_state.drill_date else parsed
+                if new_val != st.session_state.drill_date:
+                    st.session_state.drill_date = new_val
+                    st.rerun()
+    except (AttributeError, KeyError, IndexError):
+        pass
+
+with t2:
+    rate_type = st.radio("Approval rate chart", ["Line", "Bar"], horizontal=True, key="rate_type")
+    hover_rate = (
+        "<b>%{x}</b><br>"
+        "Approval rate: %{y:.1f}%<br>"
+        "Transactions: %{customdata[0]:,}<br>"
+        "Top decline: %{customdata[1]}"
+        "<extra></extra>"
+    )
+    cd_rate = daily[["transactions", "top_decline"]].values
+    if rate_type == "Line":
+        fig_rate = go.Figure(go.Scatter(
+            x=daily["date"], y=daily["approved_pct"],
+            mode="lines+markers", line=dict(color="#2ECC71"),
+            customdata=cd_rate, hovertemplate=hover_rate
+        ))
+    else:
+        fig_rate = go.Figure(go.Bar(
+            x=daily["date"], y=daily["approved_pct"],
+            marker_color="#2ECC71",
+            customdata=cd_rate, hovertemplate=hover_rate
+        ))
+    fig_rate.add_hline(y=75, line_dash="dash", line_color="gray", annotation_text="75% target")
+    fig_rate.update_layout(title="Daily Approval Rate (%) — click a point to drill down", xaxis_title="", yaxis_title="Approval Rate (%)", yaxis_range=[0, 100])
+    ev_rate = st.plotly_chart(fig_rate, on_select="rerun", use_container_width=True)
+    try:
+        if ev_rate.selection.points:
+            clicked_x = ev_rate.selection.points[0].get("x")
+            if clicked_x:
+                parsed = pd.to_datetime(clicked_x).date()
+                new_val = None if parsed == st.session_state.drill_date else parsed
+                if new_val != st.session_state.drill_date:
+                    st.session_state.drill_date = new_val
+                    st.rerun()
+    except (AttributeError, KeyError, IndexError):
+        pass
+
+# ── Transaction drill-down (date click) ──────────────────────────────────────
+if st.session_state.drill_date:
+    drill_date = st.session_state.drill_date
+    if isinstance(drill_date, str):
+        drill_date = pd.to_datetime(drill_date).date()
+    drill_df = fdf[fdf["date"] == drill_date].sort_values("timestamp").reset_index(drop=True)
+    n_drill = len(drill_df)
+    approved_drill = int(drill_df["approved"].sum())
+    rate_drill = approved_drill / n_drill * 100 if n_drill else 0
+    top_dec_drill = top_val(drill_df[~drill_df["approved"]]["decline_reason"]) if not drill_df[~drill_df["approved"]].empty else "N/A"
+
+    hdr, btn = st.columns([8, 1])
+    with hdr:
+        st.markdown(f"#### Transaction Drill-Down — **{drill_date}**")
+        st.caption(
+            f"{n_drill} transactions · {approved_drill} approved · "
+            f"{n_drill - approved_drill} declined · "
+            f"{rate_drill:.1f}% approval · Top decline reason: **{top_dec_drill}**"
+        )
+    with btn:
+        if st.button("✕ Clear", key="clear_date"):
+            st.session_state.drill_date = None
+            st.rerun()
+
+    # Mini summary by processor for this day
+    if n_drill > 0:
+        proc_summary = drill_df.groupby("processor").agg(
+            total=("id", "count"), approved_sum=("approved_int", "sum")
+        ).reset_index()
+        proc_summary["approval_rate"] = proc_summary["approved_sum"] / proc_summary["total"] * 100
+        s1, s2, s3 = st.columns(len(proc_summary))
+        for col, (_, row) in zip([s1, s2, s3], proc_summary.iterrows()):
+            col.metric(row["processor"], f"{row['approval_rate']:.1f}%", f"{int(row['total'])} txns")
+
+    st.dataframe(
+        drill_df[[
+            "id", "timestamp", "country", "payment_method",
+            "processor", "amount", "approved", "decline_reason"
+        ]],
+        use_container_width=True,
+        height=380
+    )
+    st.divider()
+
+with st.expander("Hourly Approval Rate Pattern"):
+    fig_h = go.Figure(go.Scatter(
+        x=hourly["hour"], y=hourly["approved_pct"],
+        mode="lines+markers", line=dict(color="#8E44AD"),
+        customdata=hourly[["transactions"]].values,
+        hovertemplate=(
+            "<b>Hour %{x}:00</b><br>"
+            "Approval rate: %{y:.1f}%<br>"
+            "Transactions: %{customdata[0]:,}"
+            "<extra></extra>"
+        )
+    ))
+    fig_h.update_layout(title="Approval Rate by Hour of Day (%)", xaxis_title="Hour (0–23)",
+                        yaxis_title="Approval Rate (%)", yaxis_range=[0, 100],
+                        xaxis=dict(tickmode="linear", dtick=1))
+    st.plotly_chart(fig_h, use_container_width=True)
+
+st.divider()
+
+# ── Section 2: Geography & Payment Methods ────────────────────────────────────
+st.subheader("Geography & Payment Methods")
+st.caption("Click any bar to drill down — all other charts will filter to your selection.")
+
+# Pre-compute enriched stats on overview_df (so clickable charts always show all options)
+country_stats = overview_df.groupby("country").agg(
+    total=("id", "count"), approved_sum=("approved_int", "sum")
+).reset_index()
+country_stats["approval_rate"] = country_stats["approved_sum"] / country_stats["total"] * 100
+country_stats["declined"] = country_stats["total"] - country_stats["approved_sum"]
+country_stats["top_decline"] = country_stats["country"].map(
+    overview_df[~overview_df["approved"]].groupby("country")["decline_reason"].agg(top_val)
+).fillna("N/A")
+country_stats["top_method"] = country_stats["country"].map(
+    overview_df.groupby("country")["payment_method"].agg(top_val)
+).fillna("N/A")
+# Highlight selected
+country_stats["_selected"] = country_stats["country"].apply(
+    lambda c: "Selected" if c == st.session_state.drill_country else "Other"
+)
+
+method_stats = overview_df.groupby("payment_method").agg(
+    total=("id", "count"), approved_sum=("approved_int", "sum")
+).reset_index()
+method_stats["approval_rate"] = method_stats["approved_sum"] / method_stats["total"] * 100
+method_stats["declined"] = method_stats["total"] - method_stats["approved_sum"]
+method_stats["top_decline"] = method_stats["payment_method"].map(
+    overview_df[~overview_df["approved"]].groupby("payment_method")["decline_reason"].agg(top_val)
+).fillna("N/A")
+method_stats["top_country"] = method_stats["payment_method"].map(
+    overview_df.groupby("payment_method")["country"].agg(top_val)
+).fillna("N/A")
+method_stats["_selected"] = method_stats["payment_method"].apply(
+    lambda m: "Selected" if m == st.session_state.drill_method else "Other"
+)
+
+g1, g2 = st.columns(2)
+
+with g1:
+    cs_sorted = country_stats.sort_values("approval_rate")
+    color_map = {"Selected": "#E74C3C", "Other": "#2ECC71"}
+    fig_cr = go.Figure(go.Bar(
+        x=cs_sorted["approval_rate"],
+        y=cs_sorted["country"],
+        orientation="h",
+        marker_color=[color_map.get(s, "#2ECC71") for s in cs_sorted["_selected"]],
+        customdata=cs_sorted[["total", "top_method", "top_decline", "declined"]].values,
+        hovertemplate=(
+            "<b>%{y}</b><br>"
+            "Approval rate: %{x:.1f}%<br>"
+            "Transactions: %{customdata[0]:,}  |  Declined: %{customdata[3]:,}<br>"
+            "Top payment method: %{customdata[1]}<br>"
+            "Top decline reason: %{customdata[2]}"
+            "<extra></extra>"
+        ),
+        text=cs_sorted["approval_rate"].map("{:.1f}%".format),
+        textposition="outside"
+    ))
+    fig_cr.update_layout(
+        title="Approval Rate by Country — click to drill down",
+        xaxis_range=[0, 110], xaxis_title="", yaxis_title=""
+    )
+    ev_country = st.plotly_chart(fig_cr, on_select="rerun", use_container_width=True)
+    try:
+        if ev_country.selection.points:
+            clicked = ev_country.selection.points[0].get("y")
+            if clicked:
+                new_val = None if clicked == st.session_state.drill_country else clicked
+                if new_val != st.session_state.drill_country:
+                    st.session_state.drill_country = new_val
+                    st.rerun()
+    except (AttributeError, KeyError, IndexError):
+        pass
+
+with g2:
+    method_type = st.radio("Method chart", ["Bar", "Donut"], horizontal=True, key="method_type")
+    ms_sorted = method_stats.sort_values("approval_rate")
+    if method_type == "Bar":
+        fig_m = go.Figure(go.Bar(
+            x=ms_sorted["approval_rate"],
+            y=ms_sorted["payment_method"],
+            orientation="h",
+            marker_color=[color_map.get(s, "#9B59B6") for s in ms_sorted["_selected"]],
+            customdata=ms_sorted[["total", "top_country", "top_decline", "declined"]].values,
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "Approval rate: %{x:.1f}%<br>"
+                "Transactions: %{customdata[0]:,}  |  Declined: %{customdata[3]:,}<br>"
+                "Top country: %{customdata[1]}<br>"
+                "Top decline reason: %{customdata[2]}"
+                "<extra></extra>"
+            ),
+            text=ms_sorted["approval_rate"].map("{:.1f}%".format),
+            textposition="outside"
+        ))
+        fig_m.update_layout(title="Approval Rate by Method — click to drill down",
+                            xaxis_range=[0, 110], xaxis_title="", yaxis_title="")
+        ev_method = st.plotly_chart(fig_m, on_select="rerun", use_container_width=True)
+        try:
+            if ev_method.selection.points:
+                clicked = ev_method.selection.points[0].get("y")
+                if clicked:
+                    new_val = None if clicked == st.session_state.drill_method else clicked
+                    if new_val != st.session_state.drill_method:
+                        st.session_state.drill_method = new_val
+                        st.rerun()
+        except (AttributeError, KeyError, IndexError):
+            pass
+    else:
+        fig_m = go.Figure(go.Pie(
+            labels=method_stats["payment_method"],
+            values=method_stats["total"],
+            hole=0.4,
+            customdata=method_stats[["approval_rate", "top_decline"]].values,
+            hovertemplate=(
+                "<b>%{label}</b><br>"
+                "Share: %{percent}<br>"
+                "Transactions: %{value:,}<br>"
+                "Approval rate: %{customdata[0]:.1f}%<br>"
+                "Top decline: %{customdata[1]}"
+                "<extra></extra>"
+            )
+        ))
+        fig_m.update_layout(title="Payment Methods Breakdown")
+        st.plotly_chart(fig_m, use_container_width=True)
+
+# Country × Method heatmap (uses fdf for detail view)
+if not fdf.empty:
+    pivot = fdf.pivot_table(
+        index="country", columns="payment_method",
+        values="approved_int", aggfunc="mean"
+    ) * 100
+    fig_heat = px.imshow(pivot, title="Approval Rate Heatmap: Country × Payment Method (%)",
+                         color_continuous_scale="RdYlGn", zmin=0, zmax=100,
+                         labels=dict(color="Approval %"), text_auto=".0f")
+    st.plotly_chart(fig_heat, use_container_width=True)
+
+st.divider()
+
+# ── Section 3: Processor Performance ─────────────────────────────────────────
+st.subheader("Processor Performance")
+st.caption("Click any bar to drill down.")
+
+proc_stats = overview_df.groupby("processor").agg(
+    total=("id", "count"), approved_sum=("approved_int", "sum")
+).reset_index()
+proc_stats["approval_rate"] = proc_stats["approved_sum"] / proc_stats["total"] * 100
+proc_stats["declined"] = proc_stats["total"] - proc_stats["approved_sum"]
+proc_stats["top_decline"] = proc_stats["processor"].map(
+    overview_df[~overview_df["approved"]].groupby("processor")["decline_reason"].agg(top_val)
+).fillna("N/A")
+proc_stats["top_country"] = proc_stats["processor"].map(
+    overview_df.groupby("processor")["country"].agg(top_val)
+).fillna("N/A")
+proc_stats["_selected"] = proc_stats["processor"].apply(
+    lambda p: "Selected" if p == st.session_state.drill_processor else "Other"
+)
+
+p1, p2 = st.columns(2)
+with p1:
+    colors_proc = [color_map.get(s, "#E67E22") for s in proc_stats["_selected"]]
+    fig_p = go.Figure(go.Bar(
+        x=proc_stats["processor"],
+        y=proc_stats["approval_rate"],
+        marker_color=colors_proc,
+        customdata=proc_stats[["total", "declined", "top_decline", "top_country"]].values,
+        hovertemplate=(
+            "<b>%{x}</b><br>"
+            "Approval rate: %{y:.1f}%<br>"
+            "Transactions: %{customdata[0]:,}  |  Declined: %{customdata[1]:,}<br>"
+            "Top decline reason: %{customdata[2]}<br>"
+            "Top country: %{customdata[3]}"
+            "<extra></extra>"
+        ),
+        text=proc_stats["approval_rate"].map("{:.1f}%".format),
+        textposition="outside"
+    ))
+    fig_p.update_layout(title="Approval Rate by Processor — click to drill down",
+                        yaxis_range=[0, 110], xaxis_title="", yaxis_title="Approval Rate (%)")
+    ev_proc = st.plotly_chart(fig_p, on_select="rerun", use_container_width=True)
+    try:
+        if ev_proc.selection.points:
+            clicked = ev_proc.selection.points[0].get("x")
+            if clicked:
+                new_val = None if clicked == st.session_state.drill_processor else clicked
+                if new_val != st.session_state.drill_processor:
+                    st.session_state.drill_processor = new_val
+                    st.rerun()
+    except (AttributeError, KeyError, IndexError):
+        pass
+
+with p2:
+    proc_country = fdf.groupby(["country", "processor"]).agg(
+        total=("id", "count"), approved_sum=("approved_int", "sum")
+    ).reset_index()
+    proc_country["approval_rate"] = proc_country["approved_sum"] / proc_country["total"] * 100
+    fig_pc = px.bar(proc_country, x="country", y="approval_rate", color="processor",
+                    barmode="group", title="Approval Rate by Processor × Country (%)",
+                    hover_data={"total": True, "approval_rate": ":.1f"})
+    fig_pc.update_layout(yaxis_range=[0, 100], xaxis_title="", yaxis_title="Approval Rate (%)")
+    st.plotly_chart(fig_pc, use_container_width=True)
+
+st.divider()
+
+# ── Section 4: Amount Brackets ────────────────────────────────────────────────
+st.subheader("Transaction Amount Analysis")
+
+amount_stats = fdf.groupby("amount_bin", observed=True).agg(
+    total=("id", "count"), approved_sum=("approved_int", "sum")
+).reset_index()
+amount_stats["approval_rate"] = amount_stats["approved_sum"] / amount_stats["total"] * 100
+amount_stats["declined"] = amount_stats["total"] - amount_stats["approved_sum"]
+amount_stats["top_decline"] = amount_stats["amount_bin"].map(
+    fdf[~fdf["approved"]].groupby("amount_bin", observed=True)["decline_reason"].agg(top_val)
+).fillna("N/A")
+
+a1, a2 = st.columns(2)
+with a1:
+    fig_ab = go.Figure(go.Bar(
+        x=amount_stats["amount_bin"].astype(str),
+        y=amount_stats["approval_rate"],
+        marker_color="#16A085",
+        customdata=amount_stats[["total", "declined", "top_decline"]].values,
+        hovertemplate=(
+            "<b>%{x}</b><br>"
+            "Approval rate: %{y:.1f}%<br>"
+            "Transactions: %{customdata[0]:,}  |  Declined: %{customdata[1]:,}<br>"
+            "Top decline reason: %{customdata[2]}"
+            "<extra></extra>"
+        ),
+        text=amount_stats["approval_rate"].map("{:.1f}%".format),
+        textposition="outside"
+    ))
+    fig_ab.update_layout(title="Approval Rate by Amount Bracket (%)",
+                         yaxis_range=[0, 110], xaxis_title="Amount Bracket", yaxis_title="Approval Rate (%)")
+    st.plotly_chart(fig_ab, use_container_width=True)
+
+with a2:
+    fig_av = go.Figure(go.Bar(
+        x=amount_stats["amount_bin"].astype(str),
+        y=amount_stats["total"],
+        marker_color="#4C9BE8",
+        customdata=amount_stats[["approval_rate", "declined"]].values,
+        hovertemplate=(
+            "<b>%{x}</b><br>"
+            "Transactions: %{y:,}<br>"
+            "Declined: %{customdata[1]:,}<br>"
+            "Approval rate: %{customdata[0]:.1f}%"
+            "<extra></extra>"
+        ),
+        text=amount_stats["total"],
+        textposition="outside"
+    ))
+    fig_av.update_layout(title="Transaction Count by Amount Bracket",
+                         xaxis_title="Amount Bracket", yaxis_title="Transactions")
+    st.plotly_chart(fig_av, use_container_width=True)
+
+st.divider()
+
+# ── Section 5: Decline Analysis ───────────────────────────────────────────────
+st.subheader("Decline Analysis")
+declined_df = fdf[~fdf["approved"]].copy()
+
+d1, d2 = st.columns(2)
+with d1:
+    dec_type = st.radio("Decline chart", ["Bar", "Pie"], horizontal=True, key="dec_type")
+    dec = declined_df["decline_reason"].value_counts().reset_index()
+    dec.columns = ["reason", "count"]
+    dec["pct"] = dec["count"] / dec["count"].sum() * 100
+    if dec_type == "Bar":
+        fig_dr = go.Figure(go.Bar(
+            x=dec["count"], y=dec["reason"], orientation="h",
+            marker_color="#E74C3C",
+            customdata=dec[["pct"]].values,
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "Count: %{x:,}<br>"
+                "Share of declines: %{customdata[0]:.1f}%"
+                "<extra></extra>"
+            )
+        ))
+        fig_dr.update_layout(title="Decline Reasons (Overall)", yaxis_title="", xaxis_title="Count")
+    else:
+        fig_dr = go.Figure(go.Pie(
+            labels=dec["reason"], values=dec["count"], hole=0.4,
+            hovertemplate="<b>%{label}</b><br>Count: %{value:,}<br>Share: %{percent}<extra></extra>"
+        ))
+        fig_dr.update_layout(title="Decline Reasons (Overall)")
+    st.plotly_chart(fig_dr, use_container_width=True)
+
+with d2:
+    if not declined_df.empty:
+        dec_method = declined_df.groupby(["payment_method", "decline_reason"])["id"].count().reset_index(name="count")
+        fig_dm = px.bar(dec_method, x="payment_method", y="count", color="decline_reason",
+                        barmode="stack", title="Decline Reasons by Payment Method")
+        fig_dm.update_layout(xaxis_title="", yaxis_title="Declined Transactions")
+        st.plotly_chart(fig_dm, use_container_width=True)
+
+if not declined_df.empty:
+    dec_time = declined_df.groupby(["date", "decline_reason"])["id"].count().reset_index(name="count")
+    fig_dt = px.bar(dec_time, x="date", y="count", color="decline_reason",
+                    barmode="stack", title="Decline Reasons Over Time")
+    fig_dt.update_layout(xaxis_title="", yaxis_title="Declined Transactions")
+    st.plotly_chart(fig_dt, use_container_width=True)
+
+st.divider()
+
+# ── Section 6: Anomaly Deep-Dives ─────────────────────────────────────────────
+st.subheader("Anomaly Deep-Dives")
+
+an1, an2 = st.columns(2)
+with an1:
+    pb_daily = fdf[fdf["processor"] == "Processor B"].groupby("day").agg(
+        total=("id", "count"), approved_sum=("approved_int", "sum")).reset_index()
+    pb_daily["approval_rate"] = pb_daily["approved_sum"] / pb_daily["total"] * 100
+    fig_pb = px.bar(pb_daily, x="day", y="approval_rate",
+                    title="Processor B — Daily Approval Rate (%)",
+                    color_discrete_sequence=["#E67E22"])
+    fig_pb.add_vline(x=18, line_dash="dash", line_color="red", annotation_text="Nov 18 anomaly")
+    fig_pb.update_layout(yaxis_range=[0, 100])
+    st.plotly_chart(fig_pb, use_container_width=True)
+
+with an2:
+    eu_cards = fdf[
+        fdf["country"].isin(["Spain", "Germany"]) &
+        fdf["payment_method"].isin(["card_visa", "card_mastercard"]) &
+        ~fdf["approved"]
+    ].copy()
+    if not eu_cards.empty:
+        eu_cards["period"] = eu_cards["day"].apply(lambda d: "Nov 1–15" if d <= 15 else "Nov 16–30")
+        tds = eu_cards.groupby(["period", "decline_reason"])["id"].count().reset_index(name="count")
+        fig_tds = px.bar(tds, x="period", y="count", color="decline_reason", barmode="stack",
+                         title="Spain + Germany Card Declines — 3DS Spike")
+        st.plotly_chart(fig_tds, use_container_width=True)
+
+st.divider()
+
+# ── Section 7: Recent Transactions + Export ───────────────────────────────────
+st.subheader("Recent Transactions")
+st.dataframe(
+    fdf.sort_values("timestamp", ascending=False).head(100)[[
+        "id", "timestamp", "country", "payment_method", "processor",
+        "amount", "amount_bin", "approved", "decline_reason"
+    ]].reset_index(drop=True),
+    use_container_width=True
+)
+
+csv = fdf.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label="Export Filtered Data as CSV",
+    data=csv,
+    file_name="luna_filtered_payments.csv",
+    mime="text/csv"
+)
+
+st.markdown("---")
+st.caption("Click any bar chart to drill down · Use sidebar to filter · Export to CSV for further analysis.")
