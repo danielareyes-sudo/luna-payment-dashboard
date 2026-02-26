@@ -4,13 +4,161 @@ import plotly.express as px
 import plotly.graph_objects as go
 import json
 
-st.set_page_config(page_title="Travel Payment Dashboard", layout="wide")
+st.set_page_config(
+    page_title="Luna Travel — Payment Dashboard",
+    page_icon="✈",
+    layout="wide"
+)
 
 st.markdown("""
 <style>
-    .stApp { background-color: #f8f9fa; }
-    .stSidebar { background-color: #ffffff; border-right: 1px solid #ddd; }
-    h1, h2, h3 { color: #1f77b4; }
+    /* ── Main background ── */
+    .stApp { background-color: #F4F4F8; }
+
+    /* ── Sidebar — Yuno dark navy ── */
+    section[data-testid="stSidebar"] {
+        background-color: #1C1433 !important;
+    }
+    section[data-testid="stSidebar"] .stMarkdown,
+    section[data-testid="stSidebar"] .stMarkdown p,
+    section[data-testid="stSidebar"] .stMarkdown a,
+    section[data-testid="stSidebar"] label,
+    section[data-testid="stSidebar"] span,
+    section[data-testid="stSidebar"] p {
+        color: #D8D5E8 !important;
+    }
+    section[data-testid="stSidebar"] h1,
+    section[data-testid="stSidebar"] h2,
+    section[data-testid="stSidebar"] h3 {
+        color: #FFFFFF !important;
+    }
+    section[data-testid="stSidebar"] hr {
+        border-color: #3D3257 !important;
+    }
+
+    /* ── Sidebar logo — reduce padding ── */
+    section[data-testid="stSidebar"] [data-testid="stImage"] {
+        margin-top: -1rem !important;
+        margin-bottom: -1rem !important;
+    }
+    section[data-testid="stSidebar"] [data-testid="stImage"] img {
+        max-height: 220px;
+        object-fit: contain;
+    }
+
+    /* ── Sidebar input widgets — match dark background ── */
+    /* Multiselect container */
+    section[data-testid="stSidebar"] [data-baseweb="select"] > div,
+    section[data-testid="stSidebar"] [data-baseweb="select"] > div:hover {
+        background-color: #2D2047 !important;
+        border-color: #3D3257 !important;
+    }
+    /* Multiselect tags (selected items) */
+    section[data-testid="stSidebar"] [data-baseweb="tag"] {
+        background-color: #3D3257 !important;
+    }
+    section[data-testid="stSidebar"] [data-baseweb="tag"] span {
+        color: #CAFF00 !important;
+    }
+    /* Multiselect input text */
+    section[data-testid="stSidebar"] [data-baseweb="select"] input {
+        color: #D8D5E8 !important;
+    }
+    /* Slider track */
+    section[data-testid="stSidebar"] [data-testid="stSlider"] > div > div {
+        background-color: #3D3257 !important;
+    }
+    /* Slider value box */
+    section[data-testid="stSidebar"] [data-testid="stSlider"] [data-testid="stTickBarMin"],
+    section[data-testid="stSidebar"] [data-testid="stSlider"] [data-testid="stTickBarMax"] {
+        color: #D8D5E8 !important;
+    }
+    /* Slider thumb label */
+    section[data-testid="stSidebar"] .stSlider p {
+        color: #D8D5E8 !important;
+    }
+
+    /* ── Page headings ── */
+    h1 {
+        color: #1C1433 !important;
+        font-weight: 800 !important;
+        letter-spacing: -0.02em;
+    }
+    h2 {
+        color: #1C1433 !important;
+        font-weight: 700 !important;
+    }
+    /* Subheader with Yuno lime left-border accent */
+    h3 {
+        color: #1C1433 !important;
+        font-weight: 700 !important;
+        border-left: 4px solid #CAFF00;
+        padding-left: 10px;
+        margin-top: 0.3rem;
+    }
+
+    /* ── KPI metric cards ── */
+    [data-testid="stMetric"] {
+        background: #FFFFFF;
+        border: 1px solid #E5E7EB;
+        border-radius: 12px;
+        padding: 1rem 1.2rem;
+        box-shadow: 0 2px 8px rgba(28, 20, 51, 0.06);
+    }
+    [data-testid="stMetricLabel"] p {
+        color: #6B7280 !important;
+        font-size: 0.72rem !important;
+        text-transform: uppercase;
+        letter-spacing: 0.07em;
+        font-weight: 600 !important;
+    }
+    [data-testid="stMetricValue"] {
+        color: #1C1433 !important;
+        font-weight: 700 !important;
+    }
+    [data-testid="stMetricDelta"] { font-size: 0.82rem !important; }
+
+    /* ── Buttons ── */
+    .stButton > button {
+        background-color: #CAFF00 !important;
+        color: #1C1433 !important;
+        border: none !important;
+        font-weight: 700 !important;
+        border-radius: 8px !important;
+    }
+    .stButton > button:hover {
+        background-color: #B8E600 !important;
+        color: #1C1433 !important;
+    }
+
+    /* ── Download button ── */
+    .stDownloadButton > button {
+        background-color: #1C1433 !important;
+        color: #CAFF00 !important;
+        border: none !important;
+        font-weight: 700 !important;
+        border-radius: 8px !important;
+    }
+    .stDownloadButton > button:hover {
+        background-color: #2D2047 !important;
+    }
+
+    /* ── Alert / insight cards ── */
+    .stAlert { border-radius: 10px !important; }
+
+    /* ── Expander ── */
+    details summary { font-weight: 600; color: #1C1433; }
+
+    /* ── Dataframe ── */
+    [data-testid="stDataFrame"] { border-radius: 8px; overflow: hidden; }
+
+    /* ── Plotly chart container ── */
+    [data-testid="stPlotlyChart"] {
+        background: #FFFFFF;
+        border-radius: 12px;
+        padding: 4px;
+        box-shadow: 0 1px 4px rgba(28, 20, 51, 0.05);
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -373,6 +521,23 @@ def generate_recommendations(df):
 # ── Load data ─────────────────────────────────────────────────────────────────
 df = load_data()
 
+# ── Global Plotly layout defaults (Yuno brand) ────────────────────────────────
+import plotly.io as pio
+pio.templates["yuno"] = go.layout.Template(
+    layout=go.Layout(
+        paper_bgcolor="#FFFFFF",
+        plot_bgcolor="#FFFFFF",
+        font=dict(family="Inter, -apple-system, sans-serif", color="#1C1433"),
+        title=dict(font=dict(size=14, color="#1C1433", family="Inter, sans-serif"), x=0),
+        xaxis=dict(showgrid=True, gridcolor="#F0EEF8", linecolor="#E5E7EB", zeroline=False),
+        yaxis=dict(showgrid=True, gridcolor="#F0EEF8", linecolor="#E5E7EB", zeroline=False),
+        colorway=["#6C5CE7", "#37B679", "#F77F00", "#E74C3C", "#00B4A0", "#CAFF00", "#FD79A8"],
+        margin=dict(t=48, b=32, l=32, r=16),
+        legend=dict(bgcolor="rgba(0,0,0,0)", bordercolor="rgba(0,0,0,0)"),
+    )
+)
+pio.templates.default = "yuno"
+
 # ── URL param helpers (shareable URLs) ────────────────────────────────────────
 def _qp_list(key, all_opts):
     raw = st.query_params.get(key, "")
@@ -479,7 +644,7 @@ if st.session_state.drill_method:
     fdf = fdf[fdf["payment_method"] == st.session_state.drill_method]
 
 # ── Title & KPIs ──────────────────────────────────────────────────────────────
-st.title("✈ Luna Travel — Payment Acceptance Dashboard")
+st.title("✈  Luna Travel — Payment Acceptance Dashboard")
 st.caption(f"November 2023 · Nov {day_range[0]}–{day_range[1]} · Mock transaction data")
 
 if active_drills:
@@ -634,7 +799,7 @@ if len(affected) > 0:
                      barmode="group", title="Actual vs Simulated — by Country",
                      color_discrete_map={
                          f"Actual ({sim_source})": "#E74C3C",
-                         f"Simulated ({sim_target})": "#2ECC71"
+                         f"Simulated ({sim_target})": "#37B679"
                      })
         fig.update_layout(yaxis_range=[0, 100], xaxis_title="", yaxis_title="Approval Rate (%)")
         st.plotly_chart(fig, use_container_width=True)
@@ -645,7 +810,7 @@ if len(affected) > 0:
                      barmode="group", title="Actual vs Simulated — by Method",
                      color_discrete_map={
                          f"Actual ({sim_source})": "#E74C3C",
-                         f"Simulated ({sim_target})": "#2ECC71"
+                         f"Simulated ({sim_target})": "#37B679"
                      })
         fig.update_layout(yaxis_range=[0, 100], xaxis_title="", yaxis_title="Approval Rate (%)")
         st.plotly_chart(fig, use_container_width=True)
@@ -665,7 +830,7 @@ if len(affected) > 0:
                                  line=dict(color="#E74C3C")))
         fig.add_trace(go.Scatter(x=agg_day["day"], y=agg_day["sim_rate_pct"],
                                  name=f"Simulated ({sim_target})", mode="lines+markers",
-                                 line=dict(color="#2ECC71", dash="dash")))
+                                 line=dict(color="#37B679", dash="dash")))
         fig.update_layout(title="Daily Approval Rate: Actual vs Simulated",
                           xaxis_title="Day of November", yaxis_title="Approval Rate (%)",
                           yaxis_range=[0, 100])
@@ -709,7 +874,7 @@ def _cohort_agg(da, db, col):
         return g
     return pd.concat([_agg(da, label_a), _agg(db, label_b)])
 
-period_colors = {label_a: "#4C9BE8", label_b: "#E67E22"}
+period_colors = {label_a: "#6C5CE7", label_b: "#F77F00"}
 
 comp_country  = _cohort_agg(df_a, df_b, "country")
 comp_method   = _cohort_agg(df_a, df_b, "payment_method")
@@ -784,7 +949,7 @@ with t1:
     if vol_type == "Bar":
         fig_vol = go.Figure(go.Bar(
             x=daily["date"], y=daily["transactions"],
-            marker_color="#4C9BE8",
+            marker_color="#6C5CE7",
             customdata=daily[["approved_sum", "declined", "top_decline"]].values,
             hovertemplate=(
                 "<b>%{x}</b><br>"
@@ -798,7 +963,7 @@ with t1:
     else:
         fig_vol = go.Figure(go.Scatter(
             x=daily["date"], y=daily["transactions"],
-            mode="lines+markers", line=dict(color="#4C9BE8"),
+            mode="lines+markers", line=dict(color="#6C5CE7"),
             customdata=daily[["approved_sum", "declined", "top_decline"]].values,
             hovertemplate=(
                 "<b>%{x}</b><br>"
@@ -836,13 +1001,13 @@ with t2:
     if rate_type == "Line":
         fig_rate = go.Figure(go.Scatter(
             x=daily["date"], y=daily["approved_pct"],
-            mode="lines+markers", line=dict(color="#2ECC71"),
+            mode="lines+markers", line=dict(color="#37B679"),
             customdata=cd_rate, hovertemplate=hover_rate
         ))
     else:
         fig_rate = go.Figure(go.Bar(
             x=daily["date"], y=daily["approved_pct"],
-            marker_color="#2ECC71",
+            marker_color="#37B679",
             customdata=cd_rate, hovertemplate=hover_rate
         ))
     fig_rate.add_hline(y=75, line_dash="dash", line_color="gray", annotation_text="75% target")
@@ -907,7 +1072,7 @@ if st.session_state.drill_date:
 with st.expander("Hourly Approval Rate Pattern"):
     fig_h = go.Figure(go.Scatter(
         x=hourly["hour"], y=hourly["approved_pct"],
-        mode="lines+markers", line=dict(color="#8E44AD"),
+        mode="lines+markers", line=dict(color="#6C5CE7"),
         customdata=hourly[["transactions"]].values,
         hovertemplate=(
             "<b>Hour %{x}:00</b><br>"
@@ -963,7 +1128,7 @@ g1, g2 = st.columns(2)
 
 with g1:
     cs_sorted = country_stats.sort_values("approval_rate")
-    color_map = {"Selected": "#E74C3C", "Other": "#2ECC71"}
+    color_map = {"Selected": "#E74C3C", "Other": "#6C5CE7"}
     fig_cr = go.Figure(go.Bar(
         x=cs_sorted["approval_rate"],
         y=cs_sorted["country"],
@@ -1005,7 +1170,7 @@ with g2:
             x=ms_sorted["approval_rate"],
             y=ms_sorted["payment_method"],
             orientation="h",
-            marker_color=[color_map.get(s, "#9B59B6") for s in ms_sorted["_selected"]],
+            marker_color=[color_map.get(s, "#6C5CE7") for s in ms_sorted["_selected"]],
             customdata=ms_sorted[["total", "top_country", "top_decline", "declined"]].values,
             hovertemplate=(
                 "<b>%{y}</b><br>"
@@ -1144,7 +1309,7 @@ with a1:
     fig_ab = go.Figure(go.Bar(
         x=amount_stats["amount_bin"].astype(str),
         y=amount_stats["approval_rate"],
-        marker_color="#16A085",
+        marker_color="#00B4A0",
         customdata=amount_stats[["total", "declined", "top_decline"]].values,
         hovertemplate=(
             "<b>%{x}</b><br>"
@@ -1164,7 +1329,7 @@ with a2:
     fig_av = go.Figure(go.Bar(
         x=amount_stats["amount_bin"].astype(str),
         y=amount_stats["total"],
-        marker_color="#4C9BE8",
+        marker_color="#6C5CE7",
         customdata=amount_stats[["approval_rate", "declined"]].values,
         hovertemplate=(
             "<b>%{x}</b><br>"
@@ -1240,7 +1405,7 @@ with an1:
     pb_daily["approval_rate"] = pb_daily["approved_sum"] / pb_daily["total"] * 100
     fig_pb = px.bar(pb_daily, x="day", y="approval_rate",
                     title="Processor B — Daily Approval Rate (%)",
-                    color_discrete_sequence=["#E67E22"])
+                    color_discrete_sequence=["#F77F00"])
     fig_pb.add_vline(x=18, line_dash="dash", line_color="red", annotation_text="Nov 18 anomaly")
     fig_pb.update_layout(yaxis_range=[0, 100])
     st.plotly_chart(fig_pb, use_container_width=True)
