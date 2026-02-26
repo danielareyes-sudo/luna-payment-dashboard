@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -159,6 +160,72 @@ st.markdown("""
         padding: 4px;
         box-shadow: 0 1px 4px rgba(28, 20, 51, 0.05);
     }
+
+    /* ── Sidebar expander buttons ── */
+    section[data-testid="stSidebar"] details {
+        background-color: #2D2047 !important;
+        border: 1px solid #3D3257 !important;
+        border-radius: 10px !important;
+        margin-bottom: 8px !important;
+        overflow: hidden !important;
+        box-shadow: 0 4px 0 #160B2E !important;
+    }
+    section[data-testid="stSidebar"] details summary {
+        background-color: #2D2047 !important;
+        padding: 11px 14px !important;
+        font-weight: 700 !important;
+        font-size: 0.82rem !important;
+        color: #FFFFFF !important;
+        border-radius: 10px !important;
+        list-style: none !important;
+        cursor: pointer !important;
+        letter-spacing: 0.02em !important;
+        transition: background 0.15s !important;
+    }
+    section[data-testid="stSidebar"] details summary:hover {
+        background-color: #CAFF00 !important;
+        color: #1C1433 !important;
+    }
+    section[data-testid="stSidebar"] details[open] {
+        box-shadow: 0 1px 0 #160B2E !important;
+    }
+    section[data-testid="stSidebar"] details[open] summary {
+        border-radius: 10px 10px 0 0 !important;
+        border-bottom: 1px solid #3D3257 !important;
+        background-color: #CAFF00 !important;
+        color: #1C1433 !important;
+    }
+    section[data-testid="stSidebar"] details > div {
+        padding: 12px 10px 6px 10px !important;
+        background-color: #1C1433 !important;
+    }
+    /* Hide default triangle on summary */
+    section[data-testid="stSidebar"] details summary::-webkit-details-marker { display: none !important; }
+    section[data-testid="stSidebar"] details summary::marker { display: none !important; }
+
+    /* ── Search bar ── */
+    [data-testid="stTextInput"] > div > div > input {
+        border-radius: 12px !important;
+        border: 1.5px solid #3D3257 !important;
+        padding: 1.1rem 1.6rem !important;
+        font-size: 1.05rem !important;
+        font-weight: 700 !important;
+        background: #1C1433 !important;
+        color: #FFFFFF !important;
+        box-shadow: 0 5px 0 #0A0519, 0 2px 10px rgba(0,0,0,0.25) !important;
+        transition: border-color 0.15s, box-shadow 0.15s !important;
+    }
+    [data-testid="stTextInput"] > div > div > input::placeholder {
+        color: #FFFFFF !important;
+        font-weight: 700 !important;
+        opacity: 0.85 !important;
+    }
+    [data-testid="stTextInput"] > div > div > input:focus {
+        border-color: #CAFF00 !important;
+        box-shadow: 0 2px 0 #0A0519, 0 0 0 3px rgba(202,255,0,0.2) !important;
+        outline: none !important;
+    }
+    [data-testid="stTextInput"] > label { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -538,6 +605,460 @@ pio.templates["yuno"] = go.layout.Template(
 )
 pio.templates.default = "yuno"
 
+# ── Plotly chart wrapper — disables double-click axis reset ──────────────────
+def _plot(fig, **kwargs):
+    kwargs["config"] = {"doubleClick": False, "displaylogo": False}
+    return st.plotly_chart(fig, **kwargs)
+
+
+# ── Natural-language query parser ─────────────────────────────────────────────
+def parse_query(query, df):
+    """Extract filters + intent from free-text / question. Returns dict."""
+    import re, difflib
+
+    q = query.lower().strip()
+
+    # ── Dimension extraction ──────────────────────────────────────────────────
+    country_aliases = {"brasil": "Brazil", "br": "Brazil", "mex": "Mexico",
+                       "arg": "Argentina", "col": "Colombia", "esp": "Spain",
+                       "ger": "Germany", "deutschland": "Germany"}
+    found_countries = []
+    for c in df["country"].unique():
+        if c.lower() in q or any(w == c.lower() for w in q.split()):
+            found_countries.append(c)
+    for alias, real in country_aliases.items():
+        if alias in q.split() and real not in found_countries:
+            found_countries.append(real)
+
+    found_processors = []
+    for p in df["processor"].unique():
+        if p.lower() in q or p.lower().replace(" ", "") in q.replace(" ", ""):
+            found_processors.append(p)
+        elif difflib.SequenceMatcher(None, p.lower(), q).ratio() > 0.72:
+            found_processors.append(p)
+
+    method_aliases = {
+        "3ds": ["card_visa", "card_mastercard"],
+        "card": ["card_visa", "card_mastercard"],
+        "visa": ["card_visa"], "mastercard": ["card_mastercard"],
+        "pix": ["PIX"], "oxxo": ["OXXO"], "sepa": ["SEPA"],
+    }
+    found_methods = []
+    for alias, actuals in method_aliases.items():
+        if alias in q:
+            found_methods.extend(actuals)
+    for m in df["payment_method"].unique():
+        if m.lower() in q and m not in found_methods:
+            found_methods.append(m)
+    found_methods = list(dict.fromkeys(found_methods))
+
+    reason_aliases = {
+        "3ds failure": "3ds_failure", "3ds": "3ds_failure",
+        "fraud": "fraud_suspicion", "insufficient": "insufficient_funds",
+        "insufficient funds": "insufficient_funds",
+        "technical": "technical_error", "technical error": "technical_error",
+        "expired": "expired_card", "expired card": "expired_card",
+        "outage": "technical_error",
+    }
+    found_reasons = []
+    for alias, actual in reason_aliases.items():
+        if alias in q and actual not in found_reasons:
+            found_reasons.append(actual)
+    for r in df["decline_reason"].dropna().unique():
+        if r.lower().replace("_", " ") in q and r not in found_reasons:
+            found_reasons.append(r)
+
+    # ── Day / time extraction ─────────────────────────────────────────────────
+    day_range = None
+    m = re.search(r'last\s+(\d+)\s+day', q)
+    if m:
+        n = int(m.group(1))
+        max_day = int(df["day"].max())
+        day_range = (max(1, max_day - n + 1), max_day)
+    m = re.search(r'(?:nov(?:ember)?\s+)?day\s+(\d+)(?:\s*(?:to|-)\s*(\d+))?', q)
+    if m and not day_range:
+        d1 = int(m.group(1))
+        d2 = int(m.group(2)) if m.group(2) else d1
+        day_range = (d1, d2)
+    m = re.search(r'nov(?:ember)?\s+(\d+)(?:\s*(?:to|-)\s*(\d+))?', q)
+    if m and not day_range:
+        d1 = int(m.group(1))
+        d2 = int(m.group(2)) if m.group(2) else d1
+        day_range = (d1, d2)
+    if re.search(r'first half|early month|nov 1.?15', q):
+        day_range = (1, 15)
+    elif re.search(r'second half|late month|nov 16.?30', q):
+        day_range = (16, 30)
+
+    # ── Amount extraction ─────────────────────────────────────────────────────
+    amount_filter = None
+    if "high value" in q or "high-value" in q:
+        amount_filter = ("gt", 400)
+    else:
+        m = re.search(r'>\s*\$?(\d+)', q)
+        if m:
+            amount_filter = ("gt", int(m.group(1)))
+        m = re.search(r'<\s*\$?(\d+)', q)
+        if m:
+            amount_filter = ("lt", int(m.group(1)))
+
+    # ── Approval status ───────────────────────────────────────────────────────
+    approved_filter = None
+    if re.search(r'\bapproved\b', q) and not re.search(r'\bdeclined?\b', q):
+        approved_filter = True
+    elif re.search(r'\bdeclined?\b', q) and not re.search(r'\bapproved\b', q):
+        approved_filter = False
+
+    # ── Apply filters ─────────────────────────────────────────────────────────
+    rdf = df.copy()
+    if found_countries:  rdf = rdf[rdf["country"].isin(found_countries)]
+    if found_processors: rdf = rdf[rdf["processor"].isin(found_processors)]
+    if found_methods:    rdf = rdf[rdf["payment_method"].isin(found_methods)]
+    if found_reasons:    rdf = rdf[rdf["decline_reason"].isin(found_reasons)]
+    if day_range:        rdf = rdf[rdf["day"].between(day_range[0], day_range[1])]
+    if approved_filter is True:  rdf = rdf[rdf["approved"]]
+    if approved_filter is False: rdf = rdf[~rdf["approved"]]
+    if amount_filter:
+        op, val = amount_filter
+        rdf = rdf[rdf["amount"] > val] if op == "gt" else rdf[rdf["amount"] < val]
+
+    any_filter = bool(found_countries or found_processors or found_methods or
+                      found_reasons or day_range or amount_filter or
+                      approved_filter is not None)
+
+    # ── Question answering ────────────────────────────────────────────────────
+    answer = None
+    n = len(rdf)
+    rate = rdf["approved_int"].mean() * 100 if n > 0 else 0
+    dec_df = rdf[~rdf["approved"]]
+
+    if re.search(r'how many|count|total', q):
+        if re.search(r'\bdeclined?\b', q):
+            answer = f"**{len(dec_df):,}** declined transactions"
+        elif re.search(r'\bapproved\b', q):
+            answer = f"**{int(rdf['approved'].sum()):,}** approved transactions"
+        else:
+            answer = f"**{n:,}** transactions matched"
+    elif re.search(r'approval rate|what.*(rate|percent)', q):
+        answer = f"Approval rate: **{rate:.1f}%** across {n:,} transactions"
+    elif re.search(r'top decline|main (decline|reason)|why.*declin|most common', q):
+        if not dec_df.empty:
+            vc = dec_df["decline_reason"].value_counts()
+            answer = f"Top decline reason: **{vc.index[0]}** — {vc.iloc[0]:,} times ({vc.iloc[0]/vc.sum()*100:.0f}% of declines)"
+    elif re.search(r'average|avg|mean.*amount', q):
+        answer = f"Average transaction amount: **${rdf['amount'].mean():.2f}**"
+    elif re.search(r'total volume|revenue|total amount', q):
+        answer = f"Total volume: **${rdf['amount'].sum():,.0f}**"
+    elif re.search(r'best processor|which processor', q):
+        if n > 0:
+            pg = rdf.groupby("processor")["approved_int"].mean() * 100
+            best = pg.idxmax()
+            answer = f"Best processor in this view: **{best}** at {pg.max():.1f}% approval"
+
+    return {
+        "filtered_df": rdf,
+        "answer": answer,
+        "any_filter": any_filter,
+        "filters": {
+            "countries": found_countries, "processors": found_processors,
+            "methods": found_methods, "reasons": found_reasons,
+            "day_range": day_range, "approved": approved_filter,
+            "amount": amount_filter,
+        },
+    }
+
+
+def render_data_results(query, parsed):
+    rdf  = parsed["filtered_df"]
+    n    = len(rdf)
+    rate = rdf["approved_int"].mean() * 100 if n > 0 else 0
+    dec  = int((~rdf["approved"]).sum()) if n > 0 else 0
+
+    # Answer card (question detected)
+    if parsed["answer"]:
+        st.markdown(f"""
+        <div style="background:#1C1433;border-radius:12px;padding:16px 20px;margin:6px 0 12px;">
+          <div style="font-size:0.68rem;color:#CAFF00;font-weight:700;letter-spacing:0.1em;
+                      text-transform:uppercase;margin-bottom:6px;">Answer</div>
+          <div style="font-size:1.05rem;color:#FFFFFF;">{parsed['answer'].replace("**","<b>").replace("**","</b>")}</div>
+          <div style="font-size:0.72rem;color:#9CA3AF;margin-top:6px;">Based on {n:,} matching transactions</div>
+        </div>""", unsafe_allow_html=True)
+
+    # Mini KPI row
+    if n > 0:
+        top_dec = rdf[~rdf["approved"]]["decline_reason"].value_counts()
+        top_dec_label = f"{top_dec.index[0].replace('_',' ')} ({top_dec.iloc[0]/top_dec.sum()*100:.0f}%)" if not top_dec.empty else "—"
+        st.markdown(f"""
+        <div style="display:flex;gap:10px;margin:0 0 12px;">
+          <div style="flex:1;background:#FFFFFF;border:1px solid #E5E7EB;border-radius:10px;
+                      padding:12px 14px;box-shadow:0 1px 4px rgba(28,20,51,0.05);">
+            <div style="font-size:0.65rem;color:#6B7280;text-transform:uppercase;
+                        letter-spacing:0.07em;font-weight:700;">Transactions</div>
+            <div style="font-size:1.4rem;font-weight:800;color:#1C1433;">{n:,}</div>
+          </div>
+          <div style="flex:1;background:#FFFFFF;border:1px solid #E5E7EB;border-radius:10px;
+                      padding:12px 14px;box-shadow:0 1px 4px rgba(28,20,51,0.05);">
+            <div style="font-size:0.65rem;color:#6B7280;text-transform:uppercase;
+                        letter-spacing:0.07em;font-weight:700;">Approval Rate</div>
+            <div style="font-size:1.4rem;font-weight:800;color:#166534;">{rate:.1f}%</div>
+          </div>
+          <div style="flex:1;background:#FFFFFF;border:1px solid #E5E7EB;border-radius:10px;
+                      padding:12px 14px;box-shadow:0 1px 4px rgba(28,20,51,0.05);">
+            <div style="font-size:0.65rem;color:#6B7280;text-transform:uppercase;
+                        letter-spacing:0.07em;font-weight:700;">Declined</div>
+            <div style="font-size:1.4rem;font-weight:800;color:#991B1B;">{dec:,}</div>
+          </div>
+          <div style="flex:1;background:#FFFFFF;border:1px solid #E5E7EB;border-radius:10px;
+                      padding:12px 14px;box-shadow:0 1px 4px rgba(28,20,51,0.05);">
+            <div style="font-size:0.65rem;color:#6B7280;text-transform:uppercase;
+                        letter-spacing:0.07em;font-weight:700;">Top Decline</div>
+            <div style="font-size:0.95rem;font-weight:700;color:#1C1433;margin-top:4px;">{top_dec_label}</div>
+          </div>
+          <div style="flex:1;background:#FFFFFF;border:1px solid #E5E7EB;border-radius:10px;
+                      padding:12px 14px;box-shadow:0 1px 4px rgba(28,20,51,0.05);">
+            <div style="font-size:0.65rem;color:#6B7280;text-transform:uppercase;
+                        letter-spacing:0.07em;font-weight:700;">Avg Amount</div>
+            <div style="font-size:1.4rem;font-weight:800;color:#1C1433;">${rdf['amount'].mean():.0f}</div>
+          </div>
+        </div>""", unsafe_allow_html=True)
+
+        # Mini transaction table
+        st.dataframe(
+            rdf.sort_values("timestamp", ascending=False).head(15)[[
+                "id", "timestamp", "country", "payment_method",
+                "processor", "amount", "approved", "decline_reason"
+            ]].reset_index(drop=True),
+            use_container_width=True,
+            height=280,
+        )
+    else:
+        st.markdown("""
+        <div style="padding:14px 18px;background:#FEF9C3;border:1px solid #F59E0B;
+                    border-radius:10px;color:#92400E;font-size:0.88rem;">
+            No transactions matched those filters. Try broadening your search.
+        </div>""", unsafe_allow_html=True)
+
+
+# ── Smart fuzzy search (section navigation) ───────────────────────────────────
+def smart_search(query, df):
+    import difflib
+    if not query or len(query.strip()) < 2:
+        return []
+    q = query.lower().strip().replace("_", " ")
+    results = []
+
+    # ── 1. Transaction ID match ───────────────────────────────────────────────
+    if "txn" in q or q.replace(" ", "").replace("-", "").isdigit():
+        matches = df[df["id"].str.lower().str.contains(q.replace(" ", ""), na=False)].head(4)
+        for _, row in matches.iterrows():
+            status = "✅ Approved" if row["approved"] else f"❌ {row['decline_reason']}"
+            results.append({
+                "type": "transaction",
+                "icon": "🧾",
+                "label": row["id"],
+                "detail": f"{row['country']} · {row['payment_method']} · ${row['amount']:.2f} · {status}",
+                "link": "#transactions",
+                "score": 1.0,
+            })
+
+    # ── 2. Dimension value fuzzy match ────────────────────────────────────────
+    dim_config = [
+        ("country",         df["country"].unique(),                  "#geography",  "🌍"),
+        ("processor",       df["processor"].unique(),                 "#processors", "⚙️"),
+        ("payment_method",  df["payment_method"].unique(),            "#geography",  "💳"),
+        ("decline_reason",  df["decline_reason"].dropna().unique(),   "#declines",   "❌"),
+    ]
+    for dim, values, link, icon in dim_config:
+        for val in values:
+            val_norm = val.lower().replace("_", " ")
+            score = 0.0
+            if q in val_norm or val_norm in q:
+                score = 0.95
+            elif any(w in val_norm for w in q.split() if len(w) > 2):
+                score = 0.78
+            else:
+                score = difflib.SequenceMatcher(None, q, val_norm).ratio()
+            if score > 0.45:
+                sub   = df[df[dim] == val]
+                rate  = sub["approved_int"].mean() * 100
+                count = len(sub)
+                dec   = int((~sub["approved"]).sum())
+                results.append({
+                    "type":   "filter",
+                    "icon":   icon,
+                    "label":  val.replace("_", " ").title(),
+                    "detail": f"{rate:.0f}% approval · {count:,} transactions · {dec:,} declined",
+                    "link":   link,
+                    "score":  score,
+                })
+
+    # ── 3. Section / keyword match ────────────────────────────────────────────
+    section_keywords = [
+        (["what changed", "insight", "anomal", "alert"],         "#what-changed",    "📊", "What Changed",           "Auto-detected anomalies in current view"),
+        (["recommend", "action", "next step", "fix"],            "#recommendations", "💡", "Smart Recommendations",  "Actionable steps based on data"),
+        (["what if", "simulat", "rout", "redirect"],             "#what-if",         "🔀", "What-If Simulator",      "Estimate impact of routing decisions"),
+        (["cohort", "compar", "period", "before", "after"],      "#cohort",          "📅", "Cohort Comparison",      "Compare two time periods side by side"),
+        (["time", "trend", "daily", "hourly", "volume"],         "#time-trends",     "📈", "Time Trends",            "Daily volume & approval rate over time"),
+        (["geo", "map", "region", "country", "method"],          "#geography",       "🌍", "Geography & Methods",    "Approval rates by country & payment method"),
+        (["processor", "process", "acquirer"],                   "#processors",      "⚙️", "Processor Performance",  "Processor comparison & country breakdown"),
+        (["amount", "value", "bracket", "high value", "size"],   "#amounts",         "💰", "Amount Analysis",        "Approval by transaction size"),
+        (["declin", "reason", "fail", "fraud", "3ds",
+          "insufficient", "expired", "technical"],               "#declines",        "❌", "Decline Analysis",       "Decline reason breakdown"),
+        (["outage", "nov 18", "processor b", "deep dive"],       "#anomalies",       "🚨", "Anomaly Deep-Dives",     "Processor B outage & 3DS spike"),
+        (["transaction", "recent", "table", "list", "txn"],      "#transactions",    "🧾", "Recent Transactions",    "Sortable transaction table & export"),
+    ]
+    for keywords, link, icon, title, desc in section_keywords:
+        best = 0.0
+        for kw in keywords:
+            if kw in q:
+                best = max(best, 0.88)
+            else:
+                best = max(best, difflib.SequenceMatcher(None, q, kw).ratio() * 0.82)
+        if best > 0.42:
+            results.append({"type": "section", "icon": icon, "label": title,
+                             "detail": desc, "link": link, "score": best})
+
+    # ── 4. Deduplicate & sort ─────────────────────────────────────────────────
+    seen, unique = set(), []
+    for r in sorted(results, key=lambda x: -x["score"]):
+        if r["label"] not in seen:
+            seen.add(r["label"])
+            unique.append(r)
+    return unique[:8]
+
+
+def render_search_results(query, results):
+    if not results:
+        st.markdown(f"""
+        <div style="margin:6px 0 16px;padding:12px 18px;background:#F9FAFB;border-radius:10px;
+                    border:1px solid #E5E7EB;color:#6B7280;font-size:0.85rem;">
+            No results for <b>"{query}"</b> — try a country, processor, payment method, or section name.
+        </div>""", unsafe_allow_html=True)
+        return
+
+    badge_styles = {
+        "transaction": ("#E0F2FE", "#0369A1"),
+        "filter":      ("#F0FDF4", "#166534"),
+        "section":     ("#F3F0FF", "#5B21B6"),
+    }
+    cards = ""
+    for r in results:
+        bg, fg = badge_styles.get(r["type"], ("#F9FAFB", "#374151"))
+        cards += f"""
+        <a href="{r['link']}" style="text-decoration:none;">
+          <div style="background:#FFFFFF;border:1.5px solid #E5E7EB;border-radius:10px;
+                      padding:11px 14px;display:flex;align-items:center;gap:11px;
+                      transition:border-color 0.15s,box-shadow 0.15s;"
+               onmouseover="this.style.borderColor='#CAFF00';this.style.boxShadow='0 2px 10px rgba(28,20,51,0.08)'"
+               onmouseout="this.style.borderColor='#E5E7EB';this.style.boxShadow='none'">
+            <span style="font-size:1.25rem;flex-shrink:0;">{r['icon']}</span>
+            <div style="flex:1;min-width:0;">
+              <div style="font-weight:700;color:#1C1433;font-size:0.87rem;
+                          white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{r['label']}</div>
+              <div style="color:#6B7280;font-size:0.74rem;margin-top:2px;">{r['detail']}</div>
+            </div>
+            <span style="background:{bg};color:{fg};padding:2px 8px;border-radius:20px;
+                         font-size:0.63rem;font-weight:700;text-transform:uppercase;
+                         letter-spacing:0.05em;white-space:nowrap;flex-shrink:0;">{r['type']}</span>
+            <span style="color:#9CA3AF;font-size:0.85rem;flex-shrink:0;">→</span>
+          </div>
+        </a>"""
+
+    st.markdown(f"""
+    <div style="margin:6px 0 16px 0;">
+      <div style="font-size:0.68rem;color:#9CA3AF;margin-bottom:8px;font-weight:700;
+                  text-transform:uppercase;letter-spacing:0.08em;">
+        {len(results)} result{'s' if len(results)!=1 else ''} for "{query}"
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">{cards}</div>
+    </div>""", unsafe_allow_html=True)
+
+
+# ── Live alerts banner (auto-refreshes every 60s) ────────────────────────────
+@st.fragment(run_every=60)
+def live_alerts_banner():
+    import datetime
+    now = df["timestamp"].max()
+    window_start = now - pd.Timedelta(hours=3)
+    prev_start   = window_start - pd.Timedelta(hours=3)
+
+    recent   = df[df["timestamp"] >= window_start]
+    previous = df[(df["timestamp"] >= prev_start) & (df["timestamp"] < window_start)]
+
+    alerts = []
+
+    if len(recent) >= 5:
+        recent_rate = recent["approved_int"].mean() * 100
+
+        # Processor outage: <30% approval with at least 5 transactions
+        proc_rates = recent.groupby("processor").agg(
+            total=("id", "count"), approved=("approved_int", "sum")
+        ).reset_index()
+        proc_rates["rate"] = proc_rates["approved"] / proc_rates["total"] * 100
+        for _, row in proc_rates.iterrows():
+            if row["total"] >= 5 and row["rate"] < 30:
+                dec_sub = recent[(recent["processor"] == row["processor"]) & ~recent["approved"]]
+                top_r = dec_sub["decline_reason"].value_counts()
+                top_label = f" — {top_r.index[0]} ({top_r.iloc[0]/len(dec_sub)*100:.0f}% of declines)" if not top_r.empty else ""
+                alerts.append({"level": "critical",
+                    "msg": f"🔴 &nbsp;<b>OUTAGE — {row['processor']}</b>: {row['rate']:.0f}% approval in last 3h ({int(row['total'])} txns){top_label}"})
+
+        # Overall rate drop vs previous 3h window
+        if len(previous) >= 5:
+            prev_rate = previous["approved_int"].mean() * 100
+            drop = prev_rate - recent_rate
+            if drop > 15:
+                lvl = "critical" if drop > 25 else "warning"
+                icon = "🔴" if drop > 25 else "🟡"
+                alerts.append({"level": lvl,
+                    "msg": f"{icon} &nbsp;<b>Approval rate falling</b>: {recent_rate:.0f}% now vs {prev_rate:.0f}% in prior window (−{drop:.0f}pp)"})
+
+        # Decline reason spike: one reason >55% of all declines
+        dec_recent = recent[~recent["approved"]]
+        if len(dec_recent) >= 5:
+            vc = dec_recent["decline_reason"].value_counts()
+            top_pct = vc.iloc[0] / vc.sum() * 100
+            if top_pct > 55:
+                alerts.append({"level": "warning",
+                    "msg": f"🟡 &nbsp;<b>{vc.index[0]} spike</b>: {top_pct:.0f}% of recent declines — possible systemic issue"})
+
+        # High-value drop: >$400 transactions with <40% approval
+        hv = recent[recent["amount"] > 400]
+        if len(hv) >= 5:
+            hv_rate = hv["approved_int"].mean() * 100
+            if hv_rate < 40:
+                alerts.append({"level": "warning",
+                    "msg": f"🟡 &nbsp;<b>High-value transactions struggling</b>: {hv_rate:.0f}% approval on {len(hv)} transactions >$400"})
+    else:
+        recent_rate = 0
+
+    last_refresh = datetime.datetime.now().strftime("%H:%M:%S")
+    n_recent = len(recent)
+
+    if alerts:
+        is_critical = any(a["level"] == "critical" for a in alerts)
+        bg    = "#FEE2E2" if is_critical else "#FFFBEB"
+        border = "#EF4444" if is_critical else "#F59E0B"
+        rows  = "".join(f'<div style="margin:3px 0 1px 0;font-size:0.88rem;">{a["msg"]}</div>' for a in alerts)
+        st.markdown(f"""
+        <div style="background:{bg};border:1.5px solid {border};border-radius:10px;padding:12px 18px;margin-bottom:4px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+                <span style="font-size:0.7rem;font-weight:700;color:#6B7280;letter-spacing:0.08em;">⚡ LIVE ALERTS — last 3 hours</span>
+                <span style="font-size:0.68rem;color:#9CA3AF;">auto-refreshed {last_refresh} · {n_recent} transactions scanned</span>
+            </div>
+            {rows}
+        </div>""", unsafe_allow_html=True)
+    else:
+        rate_str = f"{recent_rate:.0f}% approval" if n_recent >= 5 else "insufficient data"
+        st.markdown(f"""
+        <div style="background:#F0FDF4;border:1.5px solid #22C55E;border-radius:10px;padding:10px 18px;margin-bottom:4px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;">
+                <span style="font-size:0.88rem;color:#166534;font-weight:600;">✅ &nbsp;All clear — no anomalies in the last 3 hours &nbsp;<span style="font-weight:400;">({n_recent} transactions · {rate_str})</span></span>
+                <span style="font-size:0.68rem;color:#9CA3AF;">⚡ auto-refreshed {last_refresh}</span>
+            </div>
+        </div>""", unsafe_allow_html=True)
+
+
 # ── URL param helpers (shareable URLs) ────────────────────────────────────────
 def _qp_list(key, all_opts):
     raw = st.query_params.get(key, "")
@@ -559,20 +1080,48 @@ def _qp_range(key):
 
 # ── Sidebar filters ───────────────────────────────────────────────────────────
 st.sidebar.image("Yuno logo.png", use_container_width=True)
-st.sidebar.header("Filters")
+st.sidebar.markdown(
+    '<p style="font-size:0.65rem;color:#6B5F8A;text-transform:uppercase;'
+    'letter-spacing:0.1em;font-weight:700;margin:4px 0 10px 2px;">Filters</p>',
+    unsafe_allow_html=True
+)
+
 _all_countries  = sorted(df["country"].unique())
 _all_processors = sorted(df["processor"].unique())
 _all_methods    = sorted(df["payment_method"].unique())
 _all_amounts    = ["$0–50", "$50–200", "$200–500", "$500+"]
 _all_reasons    = sorted(df["decline_reason"].dropna().unique())
 
-day_range      = st.sidebar.slider("Day of November", 1, 30, _qp_range("days"))
-countries      = st.sidebar.multiselect("Country",                  _all_countries,  default=_qp_list("countries",  _all_countries))
-processors     = st.sidebar.multiselect("Processor",                _all_processors, default=_qp_list("processors", _all_processors))
-methods        = st.sidebar.multiselect("Payment Method",           _all_methods,    default=_qp_list("methods",    _all_methods))
-amount_bins    = st.sidebar.multiselect("Amount Bracket",           _all_amounts,    default=_qp_list("amounts",    _all_amounts))
-all_reasons    = _all_reasons
-decline_reasons = st.sidebar.multiselect("Decline Reason (declined only)", all_reasons, default=_qp_list("reasons", all_reasons))
+with st.sidebar.expander("📅  Date Range"):
+    day_range = st.slider("Day of November", 1, 30, _qp_range("days"), label_visibility="collapsed")
+    st.caption(f"Nov {day_range[0]} – {day_range[1]}")
+
+with st.sidebar.expander("🌍  Country"):
+    countries = st.multiselect("Country", _all_countries,
+                               default=_qp_list("countries", _all_countries),
+                               label_visibility="collapsed")
+
+with st.sidebar.expander("⚙️  Processor"):
+    processors = st.multiselect("Processor", _all_processors,
+                                default=_qp_list("processors", _all_processors),
+                                label_visibility="collapsed")
+
+with st.sidebar.expander("💳  Payment Method"):
+    methods = st.multiselect("Payment Method", _all_methods,
+                             default=_qp_list("methods", _all_methods),
+                             label_visibility="collapsed")
+
+with st.sidebar.expander("💰  Amount Bracket"):
+    amount_bins = st.multiselect("Amount Bracket", _all_amounts,
+                                 default=_qp_list("amounts", _all_amounts),
+                                 label_visibility="collapsed")
+
+with st.sidebar.expander("❌  Decline Reason"):
+    all_reasons     = _all_reasons
+    decline_reasons = st.multiselect("Decline Reason", all_reasons,
+                                     default=_qp_list("reasons", all_reasons),
+                                     label_visibility="collapsed")
+
 
 # Active click-drill display + clear button
 active_drills = {k: v for k, v in {
@@ -613,16 +1162,9 @@ for _dk in ["drill_country", "drill_processor", "drill_method"]:
     if not st.session_state.get(_dk) and _dk in st.query_params:
         del st.query_params[_dk]
 
-# Share hint in sidebar
 st.sidebar.divider()
 st.sidebar.markdown("**Share this view**")
 st.sidebar.caption("The browser URL updates with every filter change. Copy it to share this exact view.")
-
-# Cohort comparison period selectors
-st.sidebar.divider()
-st.sidebar.markdown("**Cohort Comparison**")
-period_a = st.sidebar.slider("Period A", 1, 30, (1, 15),  key="period_a")
-period_b = st.sidebar.slider("Period B", 1, 30, (16, 30), key="period_b")
 
 # ── Apply sidebar filters ─────────────────────────────────────────────────────
 overview_df = df[
@@ -644,8 +1186,108 @@ if st.session_state.drill_method:
     fdf = fdf[fdf["payment_method"] == st.session_state.drill_method]
 
 # ── Title & KPIs ──────────────────────────────────────────────────────────────
-st.title("✈  Luna Travel — Payment Acceptance Dashboard")
-st.caption(f"November 2023 · Nov {day_range[0]}–{day_range[1]} · Mock transaction data")
+st.markdown(f"""
+<div style="background:linear-gradient(135deg,#1C1433 0%,#2D1F4E 60%,#1C1433 100%);border-radius:16px;padding:0;margin-bottom:4px;border:1px solid #3D3257;box-shadow:0 6px 0 #0A0519,0 8px 32px rgba(0,0,0,0.28);overflow:hidden;">
+  <div style="height:4px;background:linear-gradient(90deg,#CAFF00,#8BCC00 60%,transparent);"></div>
+  <div style="padding:24px 28px 20px 28px;">
+    <div style="display:flex;align-items:center;gap:14px;margin-bottom:14px;">
+      <div style="background:#CAFF00;border-radius:10px;width:44px;height:44px;display:flex;align-items:center;justify-content:center;font-size:1.4rem;flex-shrink:0;box-shadow:0 3px 0 #8BCC00;">✈</div>
+      <div>
+        <div style="font-size:0.62rem;font-weight:800;letter-spacing:0.18em;text-transform:uppercase;color:#CAFF00;margin-bottom:3px;">Luna Travel</div>
+        <div style="font-size:1.55rem;font-weight:900;color:#FFFFFF;letter-spacing:-0.02em;line-height:1.1;">Payment Acceptance Dashboard</div>
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;">
+      <span style="background:rgba(202,255,0,0.12);border:1px solid rgba(202,255,0,0.28);color:#CAFF00;font-size:0.7rem;font-weight:700;padding:3px 10px;border-radius:20px;letter-spacing:0.04em;">November 2023</span>
+      <span style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.12);color:#D8D5E8;font-size:0.7rem;font-weight:600;padding:3px 10px;border-radius:20px;">Nov {day_range[0]}–{day_range[1]}</span>
+      <span style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.12);color:#D8D5E8;font-size:0.7rem;font-weight:600;padding:3px 10px;border-radius:20px;">6,000 transactions · Mock data</span>
+    </div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+live_alerts_banner()
+
+# ── Smart search bar ──────────────────────────────────────────────────────────
+st.markdown('<div style="margin:16px 0 4px 0;">', unsafe_allow_html=True)
+search_query = st.text_input(
+    "search",
+    placeholder="Ask me anything... just start typing",
+    key="global_search",
+    label_visibility="collapsed",
+)
+st.markdown('</div>', unsafe_allow_html=True)
+
+# Inject JS so results update on every keystroke (not just Enter/blur)
+components.html("""
+<script>
+(function() {
+    var timer;
+    function attach() {
+        var inputs = window.parent.document.querySelectorAll('input');
+        var box = null;
+        for (var i = 0; i < inputs.length; i++) {
+            if (inputs[i].placeholder && inputs[i].placeholder.indexOf('Ask me anything') !== -1) {
+                box = inputs[i]; break;
+            }
+        }
+        if (!box) { setTimeout(attach, 300); return; }
+        if (box._liveSearch) return;
+        box._liveSearch = true;
+        box.addEventListener('input', function() {
+            clearTimeout(timer);
+            timer = setTimeout(function() {
+                var sel = box.selectionStart;
+                // blur commits the value to Streamlit; refocus keeps UX smooth
+                box.blur();
+                requestAnimationFrame(function() {
+                    box.focus();
+                    try { box.setSelectionRange(sel, sel); } catch(e) {}
+                });
+            }, 300);
+        });
+    }
+    var attempts = 0;
+    function tryAttach() {
+        attempts++;
+        if (attempts > 30) return;
+        try { attach(); } catch(e) { setTimeout(tryAttach, 300); }
+    }
+    setTimeout(tryAttach, 500);
+})();
+</script>
+""", height=1, scrolling=False)
+
+if search_query and len(search_query.strip()) >= 2:
+    parsed = parse_query(search_query, df)
+
+    if parsed["any_filter"] or parsed["answer"]:
+        # Show live data results first
+        st.markdown(
+            f'<div style="font-size:0.68rem;color:#9CA3AF;font-weight:700;text-transform:uppercase;'
+            f'letter-spacing:0.08em;margin-bottom:8px;">Live results for "{search_query}"</div>',
+            unsafe_allow_html=True
+        )
+        render_data_results(search_query, parsed)
+
+    # Always show section navigation cards below
+    nav_results = smart_search(search_query, df)
+    nav_results = [r for r in nav_results if r["type"] == "section"]
+    if nav_results:
+        st.markdown(
+            '<div style="font-size:0.68rem;color:#9CA3AF;font-weight:700;text-transform:uppercase;'
+            'letter-spacing:0.08em;margin:12px 0 8px;">Jump to section</div>',
+            unsafe_allow_html=True
+        )
+        render_search_results(search_query, nav_results)
+
+    if not parsed["any_filter"] and not parsed["answer"] and not nav_results:
+        st.markdown(
+            f'<div style="padding:12px 18px;background:#F9FAFB;border-radius:10px;'
+            f'border:1px solid #E5E7EB;color:#6B7280;font-size:0.85rem;">'
+            f'No results for <b>"{search_query}"</b> — try a country, processor, payment method, or a question.</div>',
+            unsafe_allow_html=True
+        )
 
 if active_drills:
     drill_str = " · ".join(f"{k}: **{v}**" for k, v in active_drills.items())
@@ -657,16 +1299,134 @@ declined_n = total - approved_n
 approval_rate = approved_n / total * 100 if total else 0
 total_volume = fdf["amount"].sum()
 
-k1, k2, k3, k4, k5 = st.columns(5)
-k1.metric("Total Transactions", f"{total:,}")
-k2.metric("Approved", f"{approved_n:,}")
-k3.metric("Declined", f"{declined_n:,}")
-k4.metric("Approval Rate", f"{approval_rate:.1f}%")
-k5.metric("Total Volume", f"${total_volume:,.0f}")
+st.markdown(f"""
+<style>
+.kpi-grid {{
+    display: flex;
+    gap: 12px;
+    margin: 8px 0 4px 0;
+}}
+.kpi-card {{
+    flex: 1;
+    background: #FFFFFF;
+    border: 1.5px solid #E5E7EB;
+    border-radius: 14px;
+    padding: 18px 20px 14px 20px;
+    box-shadow: 0 5px 0 #D1D5DB, 0 2px 10px rgba(28,20,51,0.06);
+    text-decoration: none !important;
+    display: block;
+    cursor: pointer;
+    transition: transform 0.1s ease, box-shadow 0.1s ease, border-color 0.1s ease;
+}}
+.kpi-card:hover {{
+    border-color: #CAFF00;
+    box-shadow: 0 5px 0 #B0CC00, 0 4px 18px rgba(28,20,51,0.10);
+    transform: translateY(-1px);
+    text-decoration: none !important;
+}}
+.kpi-card:active {{
+    transform: translateY(4px);
+    box-shadow: 0 1px 0 #D1D5DB, 0 1px 4px rgba(28,20,51,0.05);
+}}
+.kpi-label {{
+    font-size: 0.67rem;
+    text-transform: uppercase;
+    letter-spacing: 0.09em;
+    color: #6B7280;
+    font-weight: 700;
+    margin-bottom: 8px;
+}}
+.kpi-value {{
+    font-size: 1.75rem;
+    font-weight: 800;
+    color: #1C1433;
+    line-height: 1.1;
+    letter-spacing: -0.02em;
+}}
+.kpi-sub {{
+    font-size: 0.68rem;
+    color: #9CA3AF;
+    margin-top: 10px;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+}}
+.kpi-card:hover .kpi-sub {{
+    color: #1C1433;
+}}
+</style>
+<div class="kpi-grid">
+    <a class="kpi-card" href="#time-trends">
+        <div class="kpi-label">Total Transactions</div>
+        <div class="kpi-value">{total:,}</div>
+        <div class="kpi-sub">View time trends →</div>
+    </a>
+    <a class="kpi-card" href="#time-trends">
+        <div class="kpi-label">Approved</div>
+        <div class="kpi-value" style="color:#166534;">{approved_n:,}</div>
+        <div class="kpi-sub">View time trends →</div>
+    </a>
+    <a class="kpi-card" href="#declines">
+        <div class="kpi-label">Declined</div>
+        <div class="kpi-value" style="color:#991B1B;">{declined_n:,}</div>
+        <div class="kpi-sub">View decline analysis →</div>
+    </a>
+    <a class="kpi-card" href="#what-changed">
+        <div class="kpi-label">Approval Rate</div>
+        <div class="kpi-value">{approval_rate:.1f}%</div>
+        <div class="kpi-sub">View insights →</div>
+    </a>
+    <a class="kpi-card" href="#amounts">
+        <div class="kpi-label">Total Volume</div>
+        <div class="kpi-value">${total_volume:,.0f}</div>
+        <div class="kpi-sub">View amount analysis →</div>
+    </a>
+</div>
+""", unsafe_allow_html=True)
 
 st.divider()
 
+# ── Section navigation ─────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+.nav-pill {
+    display: inline-block;
+    padding: 7px 16px;
+    background-color: #1C1433;
+    color: #D8D5E8 !important;
+    border-radius: 100px;
+    text-decoration: none !important;
+    font-size: 0.78rem;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    border: 1px solid #3D3257;
+    white-space: nowrap;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.nav-pill:hover {
+    background-color: #CAFF00 !important;
+    color: #1C1433 !important;
+    border-color: #CAFF00 !important;
+    text-decoration: none !important;
+}
+</style>
+<div style="display:flex; flex-wrap:wrap; gap:8px; padding:4px 0 20px 0;">
+    <a class="nav-pill" href="#what-changed">📊 What Changed</a>
+    <a class="nav-pill" href="#recommendations">💡 Recommendations</a>
+    <a class="nav-pill" href="#what-if">🔀 What-If Simulator</a>
+    <a class="nav-pill" href="#cohort">📅 Cohort Comparison</a>
+    <a class="nav-pill" href="#time-trends">📈 Time Trends</a>
+    <a class="nav-pill" href="#geography">🌍 Geography & Methods</a>
+    <a class="nav-pill" href="#processors">⚙️ Processors</a>
+    <a class="nav-pill" href="#amounts">💰 Amount Analysis</a>
+    <a class="nav-pill" href="#declines">❌ Decline Analysis</a>
+    <a class="nav-pill" href="#anomalies">🔍 Anomaly Deep-Dives</a>
+    <a class="nav-pill" href="#transactions">🧾 Recent Transactions</a>
+</div>
+""", unsafe_allow_html=True)
+
 # ── What Changed? ─────────────────────────────────────────────────────────────
+st.markdown('<div id="what-changed"></div>', unsafe_allow_html=True)
 insights = generate_insights(fdf)
 if insights:
     st.subheader("What Changed? — Auto-detected Insights")
@@ -681,6 +1441,7 @@ else:
 st.divider()
 
 # ── Smart Recommendations ─────────────────────────────────────────────────────
+st.markdown('<div id="recommendations"></div>', unsafe_allow_html=True)
 recs = generate_recommendations(fdf)
 if recs:
     st.subheader("Smart Recommendations")
@@ -695,6 +1456,7 @@ if recs:
     st.divider()
 
 # ── What-If Simulator ─────────────────────────────────────────────────────────
+st.markdown('<div id="what-if"></div>', unsafe_allow_html=True)
 st.subheader("What-If Simulator")
 st.caption("Estimate the impact of routing decisions. Simulated approvals are based on the target processor's observed rates for the same country × method × amount bracket combinations.")
 
@@ -802,7 +1564,7 @@ if len(affected) > 0:
                          f"Simulated ({sim_target})": "#37B679"
                      })
         fig.update_layout(yaxis_range=[0, 100], xaxis_title="", yaxis_title="Approval Rate (%)")
-        st.plotly_chart(fig, use_container_width=True)
+        _plot(fig, use_container_width=True)
 
     with sc2:
         comp = _melt_for_plot(agg_method, "payment_method")
@@ -813,7 +1575,7 @@ if len(affected) > 0:
                          f"Simulated ({sim_target})": "#37B679"
                      })
         fig.update_layout(yaxis_range=[0, 100], xaxis_title="", yaxis_title="Approval Rate (%)")
-        st.plotly_chart(fig, use_container_width=True)
+        _plot(fig, use_container_width=True)
 
     # Daily impact chart (if date range > 1 day)
     if sim_days[1] > sim_days[0]:
@@ -834,17 +1596,25 @@ if len(affected) > 0:
         fig.update_layout(title="Daily Approval Rate: Actual vs Simulated",
                           xaxis_title="Day of November", yaxis_title="Approval Rate (%)",
                           yaxis_range=[0, 100])
-        st.plotly_chart(fig, use_container_width=True)
+        _plot(fig, use_container_width=True)
 else:
     st.info(f"No transactions found for {sim_source} during Nov {sim_days[0]}–{sim_days[1]} with the selected filters.")
 
 st.divider()
 
 # ── Cohort Comparison ─────────────────────────────────────────────────────────
+st.markdown('<div id="cohort"></div>', unsafe_allow_html=True)
 st.subheader("Cohort Comparison")
+st.caption("Compare two custom time windows side by side — using current sidebar filters")
+
+co1, co2 = st.columns(2)
+with co1:
+    period_a = st.slider("Period A (Nov days)", 1, 30, (1, 15),  key="period_a")
+with co2:
+    period_b = st.slider("Period B (Nov days)", 1, 30, (16, 30), key="period_b")
+
 label_a = f"Period A  (Nov {period_a[0]}–{period_a[1]})"
 label_b = f"Period B  (Nov {period_b[0]}–{period_b[1]})"
-st.caption(f"{label_a}  ·  {label_b} — using current sidebar filters")
 
 df_a = overview_df[overview_df["day"].between(period_a[0], period_a[1])].copy()
 df_b = overview_df[overview_df["day"].between(period_b[0], period_b[1])].copy()
@@ -894,14 +1664,14 @@ with ch1:
                  barmode="group", title="Approval Rate by Country: A vs B",
                  color_discrete_map=period_colors)
     fig.update_layout(yaxis_range=[0, 100], xaxis_title="", yaxis_title="Approval Rate (%)")
-    st.plotly_chart(fig, use_container_width=True)
+    _plot(fig, use_container_width=True)
 
 with ch2:
     fig = px.bar(comp_method, x="payment_method", y="approval_rate", color="period",
                  barmode="group", title="Approval Rate by Method: A vs B",
                  color_discrete_map=period_colors)
     fig.update_layout(yaxis_range=[0, 100], xaxis_title="", yaxis_title="Approval Rate (%)")
-    st.plotly_chart(fig, use_container_width=True)
+    _plot(fig, use_container_width=True)
 
 ch3, ch4 = st.columns(2)
 with ch3:
@@ -909,18 +1679,19 @@ with ch3:
                  barmode="group", title="Approval Rate by Processor: A vs B",
                  color_discrete_map=period_colors)
     fig.update_layout(yaxis_range=[0, 100], xaxis_title="", yaxis_title="Approval Rate (%)")
-    st.plotly_chart(fig, use_container_width=True)
+    _plot(fig, use_container_width=True)
 
 with ch4:
     fig = px.bar(comp_dec, x="reason", y="count", color="period",
                  barmode="group", title="Decline Reasons: A vs B",
                  color_discrete_map=period_colors)
     fig.update_layout(xaxis_title="", yaxis_title="Count")
-    st.plotly_chart(fig, use_container_width=True)
+    _plot(fig, use_container_width=True)
 
 st.divider()
 
 # ── Section 1: Time Trends ────────────────────────────────────────────────────
+st.markdown('<div id="time-trends"></div>', unsafe_allow_html=True)
 st.subheader("Time Trends")
 
 daily = fdf.groupby("date").agg(
@@ -975,7 +1746,7 @@ with t1:
             )
         ))
     fig_vol.update_layout(title="Daily Transaction Volume — click a bar to drill down", xaxis_title="", yaxis_title="Transactions")
-    ev_vol = st.plotly_chart(fig_vol, on_select="rerun", use_container_width=True)
+    ev_vol = _plot(fig_vol, on_select="rerun", use_container_width=True)
     try:
         if ev_vol.selection.points:
             clicked_x = ev_vol.selection.points[0].get("x")
@@ -1012,7 +1783,7 @@ with t2:
         ))
     fig_rate.add_hline(y=75, line_dash="dash", line_color="gray", annotation_text="75% target")
     fig_rate.update_layout(title="Daily Approval Rate (%) — click a point to drill down", xaxis_title="", yaxis_title="Approval Rate (%)", yaxis_range=[0, 100])
-    ev_rate = st.plotly_chart(fig_rate, on_select="rerun", use_container_width=True)
+    ev_rate = _plot(fig_rate, on_select="rerun", use_container_width=True)
     try:
         if ev_rate.selection.points:
             clicked_x = ev_rate.selection.points[0].get("x")
@@ -1084,11 +1855,12 @@ with st.expander("Hourly Approval Rate Pattern"):
     fig_h.update_layout(title="Approval Rate by Hour of Day (%)", xaxis_title="Hour (0–23)",
                         yaxis_title="Approval Rate (%)", yaxis_range=[0, 100],
                         xaxis=dict(tickmode="linear", dtick=1))
-    st.plotly_chart(fig_h, use_container_width=True)
+    _plot(fig_h, use_container_width=True)
 
 st.divider()
 
 # ── Section 2: Geography & Payment Methods ────────────────────────────────────
+st.markdown('<div id="geography"></div>', unsafe_allow_html=True)
 st.subheader("Geography & Payment Methods")
 st.caption("Click any bar to drill down — all other charts will filter to your selection.")
 
@@ -1150,7 +1922,7 @@ with g1:
         title="Approval Rate by Country — click to drill down",
         xaxis_range=[0, 110], xaxis_title="", yaxis_title=""
     )
-    ev_country = st.plotly_chart(fig_cr, on_select="rerun", use_container_width=True)
+    ev_country = _plot(fig_cr, on_select="rerun", use_container_width=True)
     try:
         if ev_country.selection.points:
             clicked = ev_country.selection.points[0].get("y")
@@ -1185,7 +1957,7 @@ with g2:
         ))
         fig_m.update_layout(title="Approval Rate by Method — click to drill down",
                             xaxis_range=[0, 110], xaxis_title="", yaxis_title="")
-        ev_method = st.plotly_chart(fig_m, on_select="rerun", use_container_width=True)
+        ev_method = _plot(fig_m, on_select="rerun", use_container_width=True)
         try:
             if ev_method.selection.points:
                 clicked = ev_method.selection.points[0].get("y")
@@ -1212,7 +1984,7 @@ with g2:
             )
         ))
         fig_m.update_layout(title="Payment Methods Breakdown")
-        st.plotly_chart(fig_m, use_container_width=True)
+        _plot(fig_m, use_container_width=True)
 
 # Country × Method heatmap (uses fdf for detail view)
 if not fdf.empty:
@@ -1223,11 +1995,12 @@ if not fdf.empty:
     fig_heat = px.imshow(pivot, title="Approval Rate Heatmap: Country × Payment Method (%)",
                          color_continuous_scale="RdYlGn", zmin=0, zmax=100,
                          labels=dict(color="Approval %"), text_auto=".0f")
-    st.plotly_chart(fig_heat, use_container_width=True)
+    _plot(fig_heat, use_container_width=True)
 
 st.divider()
 
 # ── Section 3: Processor Performance ─────────────────────────────────────────
+st.markdown('<div id="processors"></div>', unsafe_allow_html=True)
 st.subheader("Processor Performance")
 st.caption("Click any bar to drill down.")
 
@@ -1267,7 +2040,7 @@ with p1:
     ))
     fig_p.update_layout(title="Approval Rate by Processor — click to drill down",
                         yaxis_range=[0, 110], xaxis_title="", yaxis_title="Approval Rate (%)")
-    ev_proc = st.plotly_chart(fig_p, on_select="rerun", use_container_width=True)
+    ev_proc = _plot(fig_p, on_select="rerun", use_container_width=True)
     try:
         if ev_proc.selection.points:
             clicked = ev_proc.selection.points[0].get("x")
@@ -1288,11 +2061,12 @@ with p2:
                     barmode="group", title="Approval Rate by Processor × Country (%)",
                     hover_data={"total": True, "approval_rate": ":.1f"})
     fig_pc.update_layout(yaxis_range=[0, 100], xaxis_title="", yaxis_title="Approval Rate (%)")
-    st.plotly_chart(fig_pc, use_container_width=True)
+    _plot(fig_pc, use_container_width=True)
 
 st.divider()
 
 # ── Section 4: Amount Brackets ────────────────────────────────────────────────
+st.markdown('<div id="amounts"></div>', unsafe_allow_html=True)
 st.subheader("Transaction Amount Analysis")
 
 amount_stats = fdf.groupby("amount_bin", observed=True).agg(
@@ -1323,7 +2097,7 @@ with a1:
     ))
     fig_ab.update_layout(title="Approval Rate by Amount Bracket (%)",
                          yaxis_range=[0, 110], xaxis_title="Amount Bracket", yaxis_title="Approval Rate (%)")
-    st.plotly_chart(fig_ab, use_container_width=True)
+    _plot(fig_ab, use_container_width=True)
 
 with a2:
     fig_av = go.Figure(go.Bar(
@@ -1343,11 +2117,12 @@ with a2:
     ))
     fig_av.update_layout(title="Transaction Count by Amount Bracket",
                          xaxis_title="Amount Bracket", yaxis_title="Transactions")
-    st.plotly_chart(fig_av, use_container_width=True)
+    _plot(fig_av, use_container_width=True)
 
 st.divider()
 
 # ── Section 5: Decline Analysis ───────────────────────────────────────────────
+st.markdown('<div id="declines"></div>', unsafe_allow_html=True)
 st.subheader("Decline Analysis")
 declined_df = fdf[~fdf["approved"]].copy()
 
@@ -1376,7 +2151,7 @@ with d1:
             hovertemplate="<b>%{label}</b><br>Count: %{value:,}<br>Share: %{percent}<extra></extra>"
         ))
         fig_dr.update_layout(title="Decline Reasons (Overall)")
-    st.plotly_chart(fig_dr, use_container_width=True)
+    _plot(fig_dr, use_container_width=True)
 
 with d2:
     if not declined_df.empty:
@@ -1384,18 +2159,19 @@ with d2:
         fig_dm = px.bar(dec_method, x="payment_method", y="count", color="decline_reason",
                         barmode="stack", title="Decline Reasons by Payment Method")
         fig_dm.update_layout(xaxis_title="", yaxis_title="Declined Transactions")
-        st.plotly_chart(fig_dm, use_container_width=True)
+        _plot(fig_dm, use_container_width=True)
 
 if not declined_df.empty:
     dec_time = declined_df.groupby(["date", "decline_reason"])["id"].count().reset_index(name="count")
     fig_dt = px.bar(dec_time, x="date", y="count", color="decline_reason",
                     barmode="stack", title="Decline Reasons Over Time")
     fig_dt.update_layout(xaxis_title="", yaxis_title="Declined Transactions")
-    st.plotly_chart(fig_dt, use_container_width=True)
+    _plot(fig_dt, use_container_width=True)
 
 st.divider()
 
 # ── Section 6: Anomaly Deep-Dives ─────────────────────────────────────────────
+st.markdown('<div id="anomalies"></div>', unsafe_allow_html=True)
 st.subheader("Anomaly Deep-Dives")
 
 an1, an2 = st.columns(2)
@@ -1408,7 +2184,7 @@ with an1:
                     color_discrete_sequence=["#F77F00"])
     fig_pb.add_vline(x=18, line_dash="dash", line_color="red", annotation_text="Nov 18 anomaly")
     fig_pb.update_layout(yaxis_range=[0, 100])
-    st.plotly_chart(fig_pb, use_container_width=True)
+    _plot(fig_pb, use_container_width=True)
 
 with an2:
     eu_cards = fdf[
@@ -1421,11 +2197,12 @@ with an2:
         tds = eu_cards.groupby(["period", "decline_reason"])["id"].count().reset_index(name="count")
         fig_tds = px.bar(tds, x="period", y="count", color="decline_reason", barmode="stack",
                          title="Spain + Germany Card Declines — 3DS Spike")
-        st.plotly_chart(fig_tds, use_container_width=True)
+        _plot(fig_tds, use_container_width=True)
 
 st.divider()
 
 # ── Section 7: Recent Transactions + Export ───────────────────────────────────
+st.markdown('<div id="transactions"></div>', unsafe_allow_html=True)
 st.subheader("Recent Transactions")
 st.dataframe(
     fdf.sort_values("timestamp", ascending=False).head(100)[[
